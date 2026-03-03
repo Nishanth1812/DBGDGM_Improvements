@@ -127,13 +127,14 @@ def train(model, dataset,
                 del ckpt_state['alpha_mean.weight']
                 del ckpt_state['alpha_std.weight']
                 model.load_state_dict(ckpt_state, strict=False)
+                logging.warning("Skipping optimizer state — Adam tensors incompatible with new subject count.")
             else:
                 model.load_state_dict(ckpt_state)
+                try:
+                    optimizer.load_state_dict(ckpt['optimizer_state'])
+                except (ValueError, KeyError, RuntimeError):
+                    logging.warning("Optimizer state incompatible — starting with fresh optimizer.")
 
-            try:
-                optimizer.load_state_dict(ckpt['optimizer_state'])
-            except (ValueError, KeyError):
-                logging.warning("Optimizer state incompatible with current model — starting with fresh optimizer.")
 
             scaler.load_state_dict(ckpt['scaler_state'])
             start_epoch    = ckpt['epoch'] + 1
