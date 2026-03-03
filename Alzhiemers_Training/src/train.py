@@ -110,21 +110,44 @@ def train(model, dataset,
         else:
             logging.info(f"Resuming training from checkpoint: {resume_from}")
             ckpt = torch.load(resume_from, map_location=device)
-            model.load_state_dict(ckpt['model_state'])
-            optimizer.load_state_dict(ckpt['optimizer_state'])
+            ckpt_state = ckpt['model_state']
+
+            ckpt_n    = ckpt_state['alpha_mean.weight'].shape[0]
+            current_n = model.alpha_mean.weight.shape[0]
+
+            if ckpt_n != current_n:
+                logging.warning(
+                    f"Subject count mismatch: checkpoint={ckpt_n}, current={current_n}. "
+                    f"Copying {min(ckpt_n, current_n)} subject embeddings; remainder reinitialises."
+                )
+                n = min(ckpt_n, current_n)
+                with torch.no_grad():
+                    model.alpha_mean.weight[:n].copy_(ckpt_state['alpha_mean.weight'][:n])
+                    model.alpha_std.weight[:n].copy_(ckpt_state['alpha_std.weight'][:n])
+                del ckpt_state['alpha_mean.weight']
+                del ckpt_state['alpha_std.weight']
+                model.load_state_dict(ckpt_state, strict=False)
+            else:
+                model.load_state_dict(ckpt_state)
+
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state'])
+            except (ValueError, KeyError):
+                logging.warning("Optimizer state incompatible with current model — starting with fresh optimizer.")
+
             scaler.load_state_dict(ckpt['scaler_state'])
             start_epoch    = ckpt['epoch'] + 1
             temp           = ckpt['temp']
             learning_rate  = ckpt['learning_rate']
             best_nll       = ckpt['best_nll']
             best_nll_train = ckpt['best_nll_train']
-            # Advance scheduler to match resumed epoch
             for _ in range(start_epoch):
                 scheduler.step()
             logging.info(
                 f"Resumed from epoch {ckpt['epoch']} | "
                 f"best valid NLL={best_nll:.4f} | temp={temp:.4f} | lr={learning_rate:.6f}"
             )
+
 
     # Fixed held-out eval split
     shuffled = dataset[:]
