@@ -197,13 +197,18 @@ def divide_graph_snapshots(time_len, valid_prop, test_prop):
     if valid_prop + test_prop >= 1:
         raise ValueError("Sum of `valid_prop` and `test_prop` must be less than 1.")
 
-    valid_time = math.floor(time_len * valid_prop)
-    test_time = math.floor(time_len * test_prop)
+    # Clamp each split to at least 1 snapshot so short sequences don't crash.
+    valid_time = max(1, math.floor(time_len * valid_prop))
+    test_time  = max(1, math.floor(time_len * test_prop))
     train_time = time_len - valid_time - test_time
 
-    if valid_time <= 0 or test_time <= 0 or train_time <= 0:
-        raise ValueError("The calculated `train_time`, `valid_time`, or `test_time` is not greater than 0. "
-                         "You might have to adjust your window size or stride.")
+    if train_time <= 0:
+        raise ValueError(
+            f"Not enough snapshots ({time_len}) to allocate at least 1 each to train, "
+            f"valid ({valid_time}), and test ({test_time}). "
+            "Reduce valid_prop/test_prop or increase window_size/window_stride so more "
+            "snapshots are generated per subject."
+        )
 
     return train_time, valid_time, test_time
 
