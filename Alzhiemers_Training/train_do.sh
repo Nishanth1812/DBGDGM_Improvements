@@ -3,8 +3,9 @@ set -euo pipefail
 
 SESSION="dbgdgm_train"
 if [[ -z "${TMUX:-}" ]]; then
-    tmux new-session -d -s "$SESSION" 2>/dev/null || tmux kill-session -t "$SESSION" && tmux new-session -d -s "$SESSION"
-    tmux send-keys -t "$SESSION" "cd $(pwd) && $0 $*" Enter
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$SESSION"
+    tmux send-keys -t "$SESSION" "cd '$(pwd)' && bash '$0' $*" Enter
     echo "Training running in tmux session '$SESSION'"
     echo "  Attach : tmux attach -t $SESSION"
     echo "  Detach : Ctrl+B then D"
