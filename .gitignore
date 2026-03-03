@@ -15,6 +15,8 @@ build/
 # Data and checkpoints — use rsync to transfer to droplet
 Alzhiemers_Training/data/
 Alzhiemers_Training/models/
+*.tar.gz
+*.tar
 
 # Training outputs (synced via rsync, not git)
 models_*/

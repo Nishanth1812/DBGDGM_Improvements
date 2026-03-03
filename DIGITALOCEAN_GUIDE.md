@@ -35,7 +35,7 @@ Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub"
 ## 2. SSH In
 
 ```bash
-ssh root@<DROPLET_IP>
+ssh root@159.203.28.232
 ```
 
 ---
@@ -54,11 +54,11 @@ Then rsync data and checkpoint from your local machine (Git Bash / WSL):
 ```bash
 rsync -avz --progress \
     H:/Personal/Internships/WeKan/DBGDGM_Improvements/Alzhiemers_Training/data/ \
-    root@<DROPLET_IP>:/root/DBGDGM_Improvements/Alzhiemers_Training/data/
+    root@159.203.28.232:/root/DBGDGM_Improvements/Alzhiemers_Training/data/
 
 rsync -avz \
     H:/Personal/Internships/WeKan/DBGDGM_Improvements/Alzhiemers_Training/models/ \
-    root@<DROPLET_IP>:/root/DBGDGM_Improvements/Alzhiemers_Training/models/
+    root@159.203.28.232:/root/DBGDGM_Improvements/Alzhiemers_Training/models/
 ```
 
 ---
@@ -113,7 +113,7 @@ tmux attach -t dbgdgm_train
 ## 7. Download Results
 
 ```bash
-rsync -avz root@<DROPLET_IP>:/mnt/trainingresults/ ./local_results/
+rsync -avz root@159.203.28.232:/mnt/trainingresults/ ./local_results/
 ```
 
 ---

@@ -19,11 +19,6 @@ pip install torch torchvision \
 
 pip install nilearn networkx "numpy>=1.26" scipy scikit-learn opencv-python-headless --quiet
 
-TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
-pip install torch-scatter torch-sparse torch-geometric \
-    -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cu121.html" \
-    --quiet
-
 VOLUME="/mnt/trainingresults"
 if [[ ! -d "$VOLUME" ]]; then
     echo "WARNING: Volume not mounted at $VOLUME. Check DigitalOcean volume attachment."
