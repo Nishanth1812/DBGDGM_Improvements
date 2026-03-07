@@ -3,6 +3,7 @@ import pathlib
 import pickle
 import time
 from collections import defaultdict
+
 import cv2
 import networkx as nx
 import nilearn.connectome as conn
@@ -26,7 +27,7 @@ def _get_oasis_sequences(data_dir="./data"):
     sequences = defaultdict(list)
     for class_name, label in class_map.items():
         class_dir = data_dir / class_name
-        files = list(class_dir.rglob("*.jpg"))
+        files = sorted(class_dir.rglob("*.jpg"))
         print(f"[dataset]   {class_name}: {len(files)} slices found", flush=True)
         for file in files:
             # OAS1_0028_MR1_mpr-1_104.jpg
@@ -39,7 +40,7 @@ def _get_oasis_sequences(data_dir="./data"):
 
     # Sort slices for each sequence and return
     out_sequences = []
-    for (label, sub, scan), slices in sequences.items():
+    for (label, sub, scan), slices in sorted(sequences.items(), key=lambda item: item[0]):
         slices.sort(key=lambda x: x[0])  # Sort by slice index
         slice_paths = [s[1] for s in slices]
         out_sequences.append({
@@ -60,7 +61,41 @@ def _zscore_timeseries(X, axis=-1):
     return X
 
 
-def _extract_timeseries_from_slices(slice_paths, grid_size=15, zscore=False, dtype=np.float64):
+def _graph_to_snapshot(graph):
+    edges = np.asarray(list(graph.edges()), dtype=np.int64)
+    if edges.size == 0:
+        edges = np.empty((0, 2), dtype=np.int64)
+
+    return {
+        "edge_index": edges,
+        "num_nodes": graph.number_of_nodes(),
+    }
+
+
+def _normalize_dataset(dataset):
+    normalized = []
+    changed = False
+
+    for new_subject_idx, sample in enumerate(dataset):
+        subject_idx, dynamic_graph, label = sample
+
+        snapshots = []
+        for graph in dynamic_graph:
+            if isinstance(graph, dict) and "edge_index" in graph and "num_nodes" in graph:
+                snapshots.append(graph)
+            else:
+                snapshots.append(_graph_to_snapshot(graph))
+                changed = True
+
+        if subject_idx != new_subject_idx:
+            changed = True
+
+        normalized.append([new_subject_idx, snapshots, label])
+
+    return normalized, changed
+
+
+def _extract_timeseries_from_slices(slice_paths, grid_size=15, zscore=False, dtype=np.float32):
     """
     Treats the series of slices as "time" and regional patches as "nodes".
     """
@@ -70,6 +105,8 @@ def _extract_timeseries_from_slices(slice_paths, grid_size=15, zscore=False, dty
     
     for t, path in enumerate(slice_paths):
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Unable to read slice image: {path}")
         h, w = img.shape
         grid_h, grid_w = h // grid_size, w // grid_size
         
@@ -138,6 +175,11 @@ def load_dataset(dataset="oasis", window_size=15, window_stride=5, measure="corr
         logging.info('Found an existing .pkl dataset. Loading...')
         with open(_filepath, "rb") as input_file:
             _dataset = pickle.load(input_file)
+        _dataset, cache_changed = _normalize_dataset(_dataset)
+        if cache_changed:
+            logging.info('Normalizing cached dataset format for stable subject indexing and faster snapshot access.')
+            with open(_filepath, "wb") as output_file:
+                pickle.dump(_dataset, output_file)
         print(f"[dataset] Loaded {len(_dataset)} samples from cache.", flush=True)
     # create and save dataset if does not exist
     else:
@@ -177,7 +219,9 @@ def load_dataset(dataset="oasis", window_size=15, window_stride=5, measure="corr
 
             print(f"[dataset]   -> Computing dynamic FC (shape={X.shape})...", flush=True)
             G = _compute_dynamic_fc(X, window_size, window_stride, measure, top_percent, **kwargs)
-            _dataset.append([idx, G, label])
+            subject_idx = len(_dataset)
+            snapshots = [_graph_to_snapshot(graph) for graph in G]
+            _dataset.append([subject_idx, snapshots, label])
 
             elapsed = time.time() - t_seq
             total_elapsed = time.time() - t_start

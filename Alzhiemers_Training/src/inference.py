@@ -26,28 +26,38 @@ def inference(model,
     Returns: None. The function saves the results of the inference to the specified save_path. The embeddings, negative log-likelihoods, AUC-ROC, AP are saved. The results are saved as 'results_inference.npy'.
     """
 
-    model_path = load_path / "checkpoint.pt"
+    model_path = load_path if load_path.is_file() else load_path / "checkpoint_best_valid.pt"
 
     try:
         checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint[0])
+        model.load_state_dict(checkpoint['model_state'])
     except FileNotFoundError:
         print(f'No model found at path: {model_path}')
+        return
 
     model.to(device)
     model.eval()
 
     embeddings = model.predict_embeddings(dataset, valid_prop=valid_prop, test_prop=test_prop)
 
-    nll, aucroc, ap = model.predict_auc_roc_precision(
+    edge_nll, edge_aucroc, edge_ap = model.predict_auc_roc_precision(
         dataset,
         valid_prop=valid_prop,
         test_prop=test_prop
     )
+    label_metrics = model.predict_label_metrics(
+        dataset,
+        valid_prop=valid_prop,
+        test_prop=test_prop,
+    )
 
-    report = (f"train nll {nll['train']} aucroc {aucroc['train']} ap {ap['train']}| "
-              f"valid nll {nll['valid']} aucroc {aucroc['valid']} ap {ap['valid']} | "
-              f"test nll {nll['test']} aucroc {aucroc['test']} ap {ap['test']}")
+    report = (
+        f"edge train nll {edge_nll['train']} aucroc {edge_aucroc['train']} ap {edge_ap['train']} | "
+        f"edge valid nll {edge_nll['valid']} aucroc {edge_aucroc['valid']} ap {edge_ap['valid']} | "
+        f"edge test nll {edge_nll['test']} aucroc {edge_aucroc['test']} ap {edge_ap['test']} | "
+        f"label loss {label_metrics['loss']} acc {label_metrics['accuracy']} "
+        f"bal_acc {label_metrics['balanced_accuracy']} macro_f1 {label_metrics['macro_f1']}"
+    )
 
     print(report)
     print("Saving embeddings.")
@@ -62,9 +72,10 @@ def inference(model,
 
     np.save(model_save_path,
             {
-                'nll': nll,
-                'aucroc': aucroc,
-                'ap': ap,
+                'edge_nll': edge_nll,
+                'edge_aucroc': edge_aucroc,
+                'edge_ap': edge_ap,
+                'label_metrics': label_metrics,
                 'embeddings': embeddings
             })
 

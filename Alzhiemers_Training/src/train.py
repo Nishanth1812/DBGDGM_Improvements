@@ -1,18 +1,21 @@
+import inspect
 import logging
 import random
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from sklearn.model_selection import train_test_split
 
 from .dataset import data_loader
 
 
 def _save_checkpoint(path, filename, model, optimizer, scaler,
                      epoch, temp, learning_rate,
-                     best_nll, best_nll_train,
-                     nll, aucroc, ap, embeddings, label):
+                     best_nll, best_nll_train, best_label_score,
+                     edge_nll, edge_aucroc, edge_ap, label_metrics,
+                     embeddings, label):
     """Save a full, resumable checkpoint to disk."""
     clean = lambda d: {k: float(v) for k, v in d.items()}
     payload = {
@@ -26,11 +29,13 @@ def _save_checkpoint(path, filename, model, optimizer, scaler,
         'learning_rate':   float(learning_rate),
         'best_nll':        float(best_nll),
         'best_nll_train':  float(best_nll_train),
+        'best_label_score': float(best_label_score),
         # ── evaluation results at this checkpoint ──────────────────
         'metrics': {
-            'nll':    clean(nll),
-            'aucroc': clean(aucroc),
-            'ap':     clean(ap),
+            'edge_nll':    clean(edge_nll),
+            'edge_aucroc': clean(edge_aucroc),
+            'edge_ap':     clean(edge_ap),
+            'label':       clean(label_metrics),
         },
         'embeddings': embeddings,
         'label': label,
@@ -46,14 +51,18 @@ def train(model, dataset,
           temp_min=0.05,
           num_epochs=1001,
           anneal_rate=0.0003,
-          batch_size=1,
-          weight_decay=0.,
+          batch_size=8,
+          weight_decay=1e-4,
           valid_prop=0.1,
           test_prop=0.1,
           device=torch.device("cpu"),
           eval_every=20,
           eval_split=0.2,
           early_stopping_patience=100,
+          classification_weight=1.0,
+          amp_dtype="bf16",
+          max_grad_norm=1.0,
+          seed=42,
           resume_from=None,
           on_checkpoint=None,
           ):
@@ -81,14 +90,23 @@ def train(model, dataset,
     logging.info(f"Model save path: {save_path}")
 
     # Initialize optimizer, scheduler & AMP scaler
-    optimizer = torch.optim.AdamW(model.parameters(),
-                                  lr=learning_rate,
-                                  weight_decay=weight_decay)
+    optimizer_kwargs = {
+        'lr': learning_rate,
+        'weight_decay': weight_decay,
+    }
+    if device.type == "cuda" and 'fused' in inspect.signature(torch.optim.AdamW).parameters:
+        optimizer_kwargs['fused'] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs, eta_min=1e-6
     )
     use_amp = device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
+    amp_dtype = amp_dtype.lower()
+    amp_torch_dtype = {
+        'bf16': torch.bfloat16,
+        'fp16': torch.float16,
+    }.get(amp_dtype, torch.bfloat16)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp and amp_torch_dtype == torch.float16)
 
     # Move model to device
     model.to(device)
@@ -96,6 +114,7 @@ def train(model, dataset,
     # Track best losses
     best_nll = float('inf')
     best_nll_train = float('inf')
+    best_label_score = float('-inf')
 
     # Early stopping state
     patience_counter = 0
@@ -116,18 +135,11 @@ def train(model, dataset,
             current_n = model.alpha_mean.weight.shape[0]
 
             if ckpt_n != current_n:
-                logging.warning(
+                raise ValueError(
                     f"Subject count mismatch: checkpoint={ckpt_n}, current={current_n}. "
-                    f"Copying {min(ckpt_n, current_n)} subject embeddings; remainder reinitialises."
+                    "Refusing partial resume to avoid embedding misalignment and overfitting. "
+                    "Start a fresh run (no --resume-from), or regenerate dataset with identical subject set/order."
                 )
-                n = min(ckpt_n, current_n)
-                with torch.no_grad():
-                    model.alpha_mean.weight[:n].copy_(ckpt_state['alpha_mean.weight'][:n])
-                    model.alpha_std.weight[:n].copy_(ckpt_state['alpha_std.weight'][:n])
-                del ckpt_state['alpha_mean.weight']
-                del ckpt_state['alpha_std.weight']
-                model.load_state_dict(ckpt_state, strict=False)
-                logging.warning("Skipping optimizer state — Adam tensors incompatible with new subject count.")
             else:
                 model.load_state_dict(ckpt_state)
                 try:
@@ -136,14 +148,17 @@ def train(model, dataset,
                     logging.warning("Optimizer state incompatible — starting with fresh optimizer.")
 
 
-            scaler.load_state_dict(ckpt['scaler_state'])
+            if 'scaler_state' in ckpt:
+                scaler.load_state_dict(ckpt['scaler_state'])
             start_epoch    = ckpt['epoch'] + 1
             temp           = ckpt['temp']
             learning_rate  = ckpt['learning_rate']
             best_nll       = ckpt['best_nll']
             best_nll_train = ckpt['best_nll_train']
-            for _ in range(start_epoch):
-                scheduler.step()
+            best_label_score = ckpt.get('best_label_score', float('-inf'))
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = learning_rate
+            scheduler.last_epoch = start_epoch - 1
             logging.info(
                 f"Resumed from epoch {ckpt['epoch']} | "
                 f"best valid NLL={best_nll:.4f} | temp={temp:.4f} | lr={learning_rate:.6f}"
@@ -151,14 +166,38 @@ def train(model, dataset,
 
 
     # Fixed held-out eval split
-    shuffled = dataset[:]
-    random.shuffle(shuffled)
-    split = int(len(shuffled) * (1 - eval_split))
-    train_dataset = shuffled[:split]
-    eval_dataset  = shuffled[split:]
+    labels = [sample[2] for sample in dataset]
+    indices = np.arange(len(dataset))
+    try:
+        train_idx, eval_idx = train_test_split(
+            indices,
+            test_size=eval_split,
+            random_state=seed,
+            shuffle=True,
+            stratify=labels,
+        )
+    except ValueError:
+        logging.warning('Falling back to a non-stratified subject split because one or more classes are too small.')
+        train_idx, eval_idx = train_test_split(
+            indices,
+            test_size=eval_split,
+            random_state=seed,
+            shuffle=True,
+        )
+
+    train_dataset = [dataset[int(index)] for index in train_idx]
+    eval_dataset = [dataset[int(index)] for index in eval_idx]
+
+    class_counts = np.bincount([sample[2] for sample in train_dataset], minlength=model.num_classes).astype(np.float32)
+    class_weights = np.ones(model.num_classes, dtype=np.float32)
+    non_zero = class_counts > 0
+    class_weights[non_zero] = class_counts[non_zero].sum() / (non_zero.sum() * class_counts[non_zero])
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+
     logging.info(f"Subject split: {len(train_dataset)} train / {len(eval_dataset)} eval (held-out)")
     logging.info(f"Early stopping patience: {early_stopping_patience} eval checks "
                  f"(= {early_stopping_patience * eval_every} epochs without improvement)")
+    logging.info(f"Classification loss weight: {classification_weight:.3f}")
 
     # ── Training loop ────────────────────────────────────────────────────────
     for epoch in range(start_epoch, num_epochs):
@@ -166,23 +205,32 @@ def train(model, dataset,
         random.shuffle(train_dataset)
         model.train()
 
-        running_loss = {'nll': 0, 'kld_z': 0, 'kld_alpha': 0, 'kld_beta': 0, 'kld_phi': 0}
+        running_loss = {'nll': 0, 'kld_z': 0, 'kld_alpha': 0, 'kld_beta': 0, 'kld_phi': 0, 'classification': 0}
 
         for batch_graphs in data_loader(train_dataset, batch_size):
             optimizer.zero_grad()
 
-            with autocast(enabled=use_amp):
+            autocast_context = (
+                torch.amp.autocast(device_type='cuda', dtype=amp_torch_dtype)
+                if use_amp else nullcontext()
+            )
+            with autocast_context:
                 batch_loss = model(batch_graphs,
                                    valid_prop=valid_prop,
                                    test_prop=test_prop,
-                                   temp=temp)
+                                   temp=temp,
+                                   class_weights=class_weights)
                 loss = (batch_loss['nll']
                         + 1.0  * batch_loss['kld_z']
                         + 0.1  * batch_loss['kld_alpha']
                         + 0.1  * batch_loss['kld_beta']
                         + 0.01 * batch_loss['kld_phi']) / len(batch_graphs)
+                loss = loss + classification_weight * (batch_loss['classification'] / len(batch_graphs))
 
             scaler.scale(loss).backward()
+            if max_grad_norm is not None and max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -198,20 +246,27 @@ def train(model, dataset,
         if epoch % eval_every == 0:
             model.eval()
             with torch.no_grad():
-                nll, aucroc, ap = model.predict_auc_roc_precision(
+                edge_nll, edge_aucroc, edge_ap = model.predict_auc_roc_precision(
                     eval_dataset,
                     valid_prop=valid_prop,
                     test_prop=test_prop)
+                label_metrics = model.predict_label_metrics(
+                    eval_dataset,
+                    valid_prop=valid_prop,
+                    test_prop=test_prop,
+                )
 
             logging.info(
                 f"Epoch {epoch} [eval | {len(eval_dataset)} held-out subjects] | "
-                f"train nll {nll['train']:.4f} aucroc {aucroc['train']:.4f} ap {ap['train']:.4f} | "
-                f"valid nll {nll['valid']:.4f} aucroc {aucroc['valid']:.4f} ap {ap['valid']:.4f} | "
-                f"test  nll {nll['test']:.4f}  aucroc {aucroc['test']:.4f}  ap {ap['test']:.4f}"
+                f"edge train nll {edge_nll['train']:.4f} aucroc {edge_aucroc['train']:.4f} ap {edge_ap['train']:.4f} | "
+                f"edge valid nll {edge_nll['valid']:.4f} aucroc {edge_aucroc['valid']:.4f} ap {edge_ap['valid']:.4f} | "
+                f"edge test nll {edge_nll['test']:.4f} aucroc {edge_aucroc['test']:.4f} ap {edge_ap['test']:.4f} | "
+                f"label loss {label_metrics['loss']:.4f} acc {label_metrics['accuracy']:.4f} "
+                f"bal_acc {label_metrics['balanced_accuracy']:.4f} macro_f1 {label_metrics['macro_f1']:.4f}"
             )
 
-            save_valid = nll['valid'] < best_nll
-            save_train = nll['train'] < best_nll_train
+            save_valid = label_metrics['balanced_accuracy'] > best_label_score
+            save_train = edge_nll['train'] < best_nll_train
 
             # Compute embeddings once if any checkpoint needs saving
             if save_valid or save_train:
@@ -224,43 +279,50 @@ def train(model, dataset,
 
             # ── Best-valid checkpoint ────────────────────────────────────────
             if save_valid:
-                logging.info(f"✓ New best valid NLL: {nll['valid']:.4f} (was {best_nll:.4f}). Saving best-valid checkpoint.")
+                logging.info(
+                    f"✓ New best held-out balanced accuracy: {label_metrics['balanced_accuracy']:.4f} "
+                    f"(was {best_label_score:.4f}). Saving best-valid checkpoint."
+                )
                 _save_checkpoint(save_path, "checkpoint_best_valid.pt",
                                   model, optimizer, scaler,
                                   epoch, temp, learning_rate,
-                                  best_nll, best_nll_train,
-                                  nll, aucroc, ap, embeddings, label="best_valid")
+                                  best_nll, best_nll_train, best_label_score,
+                                  edge_nll, edge_aucroc, edge_ap, label_metrics,
+                                  embeddings, label="best_valid")
                 if on_checkpoint: on_checkpoint()
-                best_nll = nll['valid']
+                best_nll = edge_nll['valid']
+                best_label_score = label_metrics['balanced_accuracy']
                 patience_counter = 0   # reset early-stopping counter
             else:
                 patience_counter += 1
-                logging.info(f"No valid NLL improvement. Patience: {patience_counter}/{early_stopping_patience}")
+                logging.info(f"No held-out label improvement. Patience: {patience_counter}/{early_stopping_patience}")
 
             # ── Best-train checkpoint ────────────────────────────────────────
             if save_train:
-                logging.info(f"✓ New best train NLL: {nll['train']:.4f} (was {best_nll_train:.4f}). Saving best-train checkpoint.")
+                logging.info(f"✓ New best train edge NLL: {edge_nll['train']:.4f} (was {best_nll_train:.4f}). Saving best-train checkpoint.")
                 _save_checkpoint(save_path, "checkpoint_best_train.pt",
                                   model, optimizer, scaler,
                                   epoch, temp, learning_rate,
-                                  best_nll, best_nll_train,
-                                  nll, aucroc, ap, embeddings, label="best_train")
+                                  best_nll, best_nll_train, best_label_score,
+                                  edge_nll, edge_aucroc, edge_ap, label_metrics,
+                                  embeddings, label="best_train")
                 if on_checkpoint: on_checkpoint()
-                best_nll_train = nll['train']
+                best_nll_train = edge_nll['train']
 
             # ── Latest checkpoint (always overwritten) ───────────────────────
             _save_checkpoint(save_path, "checkpoint_latest.pt",
                               model, optimizer, scaler,
                               epoch, temp, learning_rate,
-                              best_nll, best_nll_train,
-                              nll, aucroc, ap, embeddings, label="latest")
+                              best_nll, best_nll_train, best_label_score,
+                              edge_nll, edge_aucroc, edge_ap, label_metrics,
+                              embeddings, label="latest")
             if on_checkpoint: on_checkpoint()
 
             # ── Early stopping check ─────────────────────────────────────────
             if patience_counter >= early_stopping_patience:
                 logging.info(
                     f"Early stopping triggered at epoch {epoch}. "
-                    f"No valid NLL improvement for {early_stopping_patience} consecutive eval checks "
+                    f"No held-out label improvement for {early_stopping_patience} consecutive eval checks "
                     f"({patience_counter * eval_every} epochs)."
                 )
                 early_stopped = True

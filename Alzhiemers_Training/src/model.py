@@ -1,16 +1,22 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, balanced_accuracy_score, f1_score, roc_auc_score
 from torch import nn
-import math
 
-import networkx as nx
+from .utils import (
+    bce_loss,
+    divide_graph_snapshots,
+    get_status,
+    gumbel_softmax,
+    kld_gauss,
+    kld_z_loss,
+    reparameterized_sample,
+    sample_pos_neg_edges,
+    snapshot_edge_tensor,
+)
 
-from .utils import sample_pos_neg_edges, gumbel_softmax, bce_loss, kld_z_loss, kld_gauss, reparameterized_sample, \
-    get_status, divide_graph_snapshots
-
-LOSS_KEYS = ['nll', 'kld_z', 'kld_alpha', 'kld_beta', 'kld_phi']
+LOSS_KEYS = ['nll', 'kld_z', 'kld_alpha', 'kld_beta', 'kld_phi', 'classification']
 
 
 class Model(nn.Module):
@@ -38,6 +44,7 @@ class Model(nn.Module):
     def __init__(self, num_samples, num_nodes,
                  embedding_dim=32,
                  categorical_dim=3,
+                 num_classes=4,
                  gamma=0.1,
                  sigma=1.,
                  device=torch.device("cpu")):
@@ -48,6 +55,7 @@ class Model(nn.Module):
         self.num_nodes = num_nodes
         self.embedding_dim = embedding_dim
         self.categorical_dim = categorical_dim
+        self.num_classes = num_classes
         self.gamma = gamma
         self.sigma = sigma
         self.device = device
@@ -72,6 +80,10 @@ class Model(nn.Module):
         self.alpha_std_scalar = 1.
 
         self.decoder = nn.Sequential(nn.Linear(embedding_dim, num_nodes, bias=False))
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.embedding_dim),
+            nn.Linear(self.embedding_dim, self.num_classes),
+        )
 
         # Fix 2: Learned Transition Priors for temporal embedding shift
         self.phi_transition = nn.Sequential(
@@ -94,19 +106,16 @@ class Model(nn.Module):
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias.data)
 
-    def _aggregate_neighbors(self, phi: torch.Tensor, graph: nx.Graph) -> torch.Tensor:
+    def _aggregate_neighbors(self, phi: torch.Tensor, graph) -> torch.Tensor:
         """Fix 1: Aggregates embeddings of neighbors via vectorized scatter_add."""
         num_nodes = phi.shape[0]
 
-        edges = list(graph.edges())
-        if not edges:
+        edge_index = snapshot_edge_tensor(graph, device=self.device)
+        if edge_index.numel() == 0:
             return phi.clone()
 
-        # Build symmetric edge index (u->v and v->u)
-        src = torch.tensor([u for u, v in edges] + [v for u, v in edges],
-                           dtype=torch.long, device=self.device)
-        dst = torch.tensor([v for u, v in edges] + [u for u, v in edges],
-                           dtype=torch.long, device=self.device)
+        src = torch.cat((edge_index[:, 0], edge_index[:, 1]))
+        dst = torch.cat((edge_index[:, 1], edge_index[:, 0]))
 
         # Scatter-add neighbor embeddings then normalise by degree
         agg = torch.zeros_like(phi)
@@ -150,6 +159,9 @@ class Model(nn.Module):
 
         return (beta_sample, beta_mean_t, beta_std_t), (phi_sample, phi_mean_t, phi_std_t)
 
+    def _subject_representation(self, alpha_n, h_phi, h_beta):
+        return alpha_n + h_phi[-1].mean(dim=0) + h_beta[-1].mean(dim=0)
+
     def _edge_reconstruction(self, w, c, phi_sample, beta_sample, temp):
         q = self.nn_pi(phi_sample[w] * phi_sample[c])  # q(z|w, c)
         p_prior = self.nn_pi(phi_sample[w])  # p(z|w)
@@ -173,16 +185,17 @@ class Model(nn.Module):
         beta_0_mean = self.subject_to_beta(alpha_n).view(self.categorical_dim, self.embedding_dim)
         return alpha_n, kld_alpha, phi_0_mean, beta_0_mean
 
-    def forward(self, batch_data, valid_prop=0.1, test_prop=0.1, temp=1.):
+    def forward(self, batch_data, valid_prop=0.1, test_prop=0.1, temp=1., class_weights=None):
         loss = {key: 0 for key in LOSS_KEYS}
         for data in batch_data:
-            subject_idx, dynamic_graph, _ = data
-            subject_loss = self._forward(subject_idx, dynamic_graph, valid_prop, test_prop, temp)
+            subject_idx, dynamic_graph, subject_label = data
+            subject_loss = self._forward(subject_idx, dynamic_graph, subject_label, valid_prop, test_prop, temp,
+                                         class_weights=class_weights)
             for loss_name in LOSS_KEYS:
                 loss[loss_name] += subject_loss[loss_name]
         return loss
 
-    def _forward(self, subject_idx, batch_graphs, valid_prop, test_prop, temp):
+    def _forward(self, subject_idx, batch_graphs, subject_label, valid_prop, test_prop, temp, class_weights=None):
         loss = {key: 0 for key in LOSS_KEYS}
         edge_counter = 0
 
@@ -194,36 +207,64 @@ class Model(nn.Module):
 
         for snapshot_idx in range(0, train_time):
             graph = batch_graphs[snapshot_idx]
-            train_edges = [(u, v) for u, v in graph.edges()]
-            if self.training:
-                np.random.shuffle(train_edges)
+            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
 
-            batch = torch.LongTensor(train_edges).to(self.device)
-            assert batch.shape == (len(train_edges), 2)
+            batch = snapshot_edge_tensor(graph, device=self.device)
+            if batch.numel() == 0:
+                continue
+
+            if self.training and batch.shape[0] > 1:
+                permutation = torch.randperm(batch.shape[0], device=self.device)
+                batch = batch[permutation]
+
             w = torch.cat((batch[:, 0], batch[:, 1]))
             c = torch.cat((batch[:, 1], batch[:, 0]))
-
-            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
 
             (beta_sample, beta_mean_t, beta_std_t), (phi_sample, phi_mean_t, phi_std_t) = self._sample_embeddings(h_phi, h_beta)
 
             recon, posterior_z, prior_z = self._edge_reconstruction(w, c, phi_sample, beta_sample, temp)
-
-            # Fix 2: Learned prior updates transition
-            beta_prior_mean = self.beta_transition(beta_sample)
-            phi_prior_mean = self.phi_transition(phi_sample)
 
             loss['nll'] += bce_loss(recon, c)
             loss['kld_z'] += kld_z_loss(posterior_z, prior_z)
             loss['kld_alpha'] += kld_alpha
             loss['kld_beta'] += kld_gauss(beta_sample, beta_std_t, beta_prior_mean, self.gamma)
             loss['kld_phi'] += kld_gauss(phi_sample, phi_std_t, phi_prior_mean, self.sigma)
+
+            beta_prior_mean = self.beta_transition(beta_sample)
+            phi_prior_mean = self.phi_transition(phi_sample)
             edge_counter += c.shape[0]
 
-        for loss_name in loss.keys():
+        if edge_counter == 0:
+            raise ValueError(f"Subject {subject_idx} has no positive edges in the training snapshots.")
+
+        for loss_name in ['nll', 'kld_z', 'kld_alpha', 'kld_beta', 'kld_phi']:
             loss[loss_name] = loss[loss_name] / edge_counter
 
+        subject_repr = self._subject_representation(alpha_n, h_phi, h_beta)
+        logits = self.classifier(subject_repr.unsqueeze(0))
+        target = torch.tensor([subject_label], dtype=torch.long, device=self.device)
+        weight = class_weights.to(self.device) if class_weights is not None else None
+        loss['classification'] = F.cross_entropy(logits, target, weight=weight)
+
         return loss
+
+    def _encode_subject(self, subject_idx, batch_graphs, valid_prop, test_prop, use_train_snapshots_only=True):
+        alpha_n, _, phi_prior_mean, beta_prior_mean = self._initialize_subject(subject_idx)
+
+        h_beta = torch.zeros(1, self.categorical_dim, self.embedding_dim).to(self.device)
+        h_phi = torch.zeros(1, self.num_nodes, self.embedding_dim).to(self.device)
+
+        train_time, _, _ = divide_graph_snapshots(len(batch_graphs), valid_prop, test_prop)
+        total_steps = train_time if use_train_snapshots_only else len(batch_graphs)
+
+        for snapshot_idx in range(total_steps):
+            graph = batch_graphs[snapshot_idx]
+            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
+            (_, beta_mean, _), (_, phi_mean, _) = self._sample_embeddings(h_phi, h_beta)
+            beta_prior_mean = self.beta_transition(beta_mean)
+            phi_prior_mean = self.phi_transition(phi_mean)
+
+        return self._subject_representation(alpha_n, h_phi, h_beta)
 
     def predict_auc_roc_precision(self, subject_graphs, valid_prop=0.1, test_prop=0.1):
         aucroc = {'train': 0, 'valid': 0, 'test': 0}
@@ -232,7 +273,7 @@ class Model(nn.Module):
 
         num_subjects = len(subject_graphs)
         for subject in subject_graphs:
-            subject_idx, subject_graphs_s, gender_label = subject
+            subject_idx, subject_graphs_s, _ = subject
             pred, label, _nll = self._predict_auc_roc_precision(subject_idx,
                                                                 subject_graphs_s,
                                                                 valid_prop,
@@ -245,8 +286,47 @@ class Model(nn.Module):
 
         return nll, aucroc, ap
 
+    def predict_label_metrics(self, subject_graphs, valid_prop=0.1, test_prop=0.1):
+        labels = []
+        predictions = []
+        probabilities = []
+        total_loss = 0.0
+
+        for subject_idx, subject_graphs_s, subject_label in subject_graphs:
+            subject_repr = self._encode_subject(subject_idx, subject_graphs_s, valid_prop, test_prop)
+            logits = self.classifier(subject_repr.unsqueeze(0))
+            probs = F.softmax(logits, dim=-1).squeeze(0)
+            target = torch.tensor([subject_label], dtype=torch.long, device=self.device)
+
+            total_loss += F.cross_entropy(logits, target, reduction='sum').item()
+            labels.append(int(subject_label))
+            predictions.append(int(torch.argmax(probs).item()))
+            probabilities.append(probs.detach().cpu().numpy())
+
+        probabilities = np.asarray(probabilities)
+        labels = np.asarray(labels)
+        predictions = np.asarray(predictions)
+
+        metrics = {
+            'loss': total_loss / max(len(subject_graphs), 1),
+            'accuracy': float((predictions == labels).mean()) if len(labels) else float('nan'),
+            'balanced_accuracy': float(balanced_accuracy_score(labels, predictions)) if len(labels) else float('nan'),
+            'macro_f1': float(f1_score(labels, predictions, average='macro', zero_division=0)) if len(labels) else float('nan'),
+            'macro_auc_ovr': float('nan'),
+        }
+
+        unique_labels = np.unique(labels)
+        if len(unique_labels) == self.num_classes:
+            metrics['macro_auc_ovr'] = float(
+                roc_auc_score(labels, probabilities, multi_class='ovr', average='macro')
+            )
+
+        return metrics
+
     def _predict_auc_roc_precision(self, subject_idx, batch_graphs, valid_prop, test_prop):
         def _get_edge_reconstructions(edges, phi_sample, beta_sample):
+            if not edges:
+                return None, None, None, None
             batch = torch.LongTensor(edges).to(self.device)
             assert batch.shape == (len(edges), 2)
             w = torch.cat((batch[:, 0], batch[:, 1]))
@@ -272,12 +352,13 @@ class Model(nn.Module):
             (_, beta_mean, _), (_, phi_mean, _) = self._sample_embeddings(h_phi, h_beta)
 
             pos_edges, neg_edges = sample_pos_neg_edges(graph)
+            if not pos_edges or not neg_edges:
+                continue
 
             p_c_pos_given_z, p_c_pos_gt, _, c_pos = _get_edge_reconstructions(pos_edges, phi_mean, beta_mean)
             p_c_neg_given_z, p_c_neg_gt, _, _ = _get_edge_reconstructions(neg_edges, phi_mean, beta_mean)
 
-            recon_c_softmax = F.log_softmax(p_c_pos_given_z, dim=-1)
-            bce = bce_loss(recon_c_softmax, c_pos, reduction='none').detach().cpu().numpy()
+            bce = bce_loss(p_c_pos_given_z, c_pos, reduction='none').detach().cpu().numpy()
 
             pred[status] = np.hstack([pred[status], p_c_pos_gt.numpy(), p_c_neg_gt.numpy()])
             label[status] = np.hstack([label[status], np.ones(len(p_c_pos_gt)), np.zeros(len(p_c_neg_gt))])
@@ -292,7 +373,7 @@ class Model(nn.Module):
     def predict_embeddings(self, subject_graphs, valid_prop=0.1, test_prop=0.1):
         subjects = {}
         for subject in subject_graphs:
-            subject_idx, subject_graphs_s, gender_label = subject
+            subject_idx, subject_graphs_s, _ = subject
 
             subject_data = self._predict_embeddings(subject_idx, subject_graphs_s, valid_prop, test_prop)
             subjects[subject_idx] = subject_data

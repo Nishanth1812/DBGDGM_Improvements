@@ -1,14 +1,37 @@
 import itertools
 import math
 import random
+from typing import List, Tuple
 
+import networkx as nx
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-import random
-import itertools
-import networkx as nx
-from typing import List, Tuple
+
+def get_snapshot_num_nodes(snapshot) -> int:
+    if isinstance(snapshot, dict):
+        return int(snapshot['num_nodes'])
+    return snapshot.number_of_nodes()
+
+
+def snapshot_edge_array(snapshot) -> np.ndarray:
+    if isinstance(snapshot, dict):
+        edges = np.asarray(snapshot['edge_index'], dtype=np.int64)
+    else:
+        edges = np.asarray(list(snapshot.edges()), dtype=np.int64)
+
+    if edges.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+
+    return edges.reshape(-1, 2)
+
+
+def snapshot_edge_tensor(snapshot, device=None) -> torch.Tensor:
+    edges = torch.as_tensor(snapshot_edge_array(snapshot), dtype=torch.long)
+    if device is not None:
+        edges = edges.to(device)
+    return edges
 
 
 def sample_pos_neg_edges(graph: nx.Graph, num_samples: int = 1) -> Tuple[List[Tuple], List[Tuple]]:
@@ -27,11 +50,18 @@ def sample_pos_neg_edges(graph: nx.Graph, num_samples: int = 1) -> Tuple[List[Tu
         ValueError: If `num_samples` is greater than the number of available negative edges.
     """
 
-    # Extract the set of positive edges from the graph
-    pos_edges = set(graph.edges())
+    num_nodes = get_snapshot_num_nodes(graph)
+    pos_edges = {
+        tuple(sorted((int(u), int(v))))
+        for u, v in snapshot_edge_array(graph).tolist()
+        if int(u) != int(v)
+    }
+
+    if not pos_edges:
+        return [], []
 
     # Generate the set of all possible edges (both positive and negative)
-    all_edges = set(itertools.combinations(graph.nodes(), 2))
+    all_edges = set(itertools.combinations(range(num_nodes), 2))
 
     # Calculate the set of negative edges by subtracting the positive edges from all possible edges
     all_neg_edges = all_edges - pos_edges
