@@ -9,15 +9,22 @@ import torch
 from sklearn.model_selection import train_test_split
 
 from .dataset import data_loader
+from .diagnosis import evaluate_diagnosis_from_embeddings
 
 
 def _save_checkpoint(path, filename, model, optimizer, scaler,
                      epoch, temp, learning_rate,
                      best_nll, best_nll_train, best_label_score,
-                     edge_nll, edge_aucroc, edge_ap, label_metrics,
+                     edge_nll, edge_aucroc, edge_ap, label_metrics, diagnosis_metrics,
                      embeddings, label):
     """Save a full, resumable checkpoint to disk."""
-    clean = lambda d: {k: float(v) for k, v in d.items()}
+    def clean(value):
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, (np.floating, float, np.integer, int)):
+            return float(value)
+        return value
+
     payload = {
         # ── model / optimiser ──────────────────────────────────────
         'model_state':     model.state_dict(),
@@ -36,6 +43,7 @@ def _save_checkpoint(path, filename, model, optimizer, scaler,
             'edge_aucroc': clean(edge_aucroc),
             'edge_ap':     clean(edge_ap),
             'label':       clean(label_metrics),
+            'diagnosis':   clean(diagnosis_metrics),
         },
         'embeddings': embeddings,
         'label': label,
@@ -69,8 +77,10 @@ def train(model, dataset,
     """
     Trains the improved DBGDGM model using the Oasis dataset.
 
-    Early stopping monitors held-out valid NLL every `eval_every` epochs.
-    Stops if no improvement for `early_stopping_patience` consecutive eval checks.
+    Early stopping monitors held-out valid NLL every `eval_every` epochs for the
+    original DBGDGM objective. If `classification_weight > 0`, an auxiliary
+    diagnosis head is also trained and early stopping tracks held-out balanced
+    accuracy for that auxiliary task.
 
     Checkpoints saved:
       checkpoint_best_valid.pt  — best held-out validation NLL (use this for future retraining)
@@ -165,39 +175,48 @@ def train(model, dataset,
             )
 
 
-    # Fixed held-out eval split
-    labels = [sample[2] for sample in dataset]
-    indices = np.arange(len(dataset))
-    try:
-        train_idx, eval_idx = train_test_split(
-            indices,
-            test_size=eval_split,
-            random_state=seed,
-            shuffle=True,
-            stratify=labels,
-        )
-    except ValueError:
-        logging.warning('Falling back to a non-stratified subject split because one or more classes are too small.')
-        train_idx, eval_idx = train_test_split(
-            indices,
-            test_size=eval_split,
-            random_state=seed,
-            shuffle=True,
-        )
+    use_label_supervision = classification_weight is not None and classification_weight > 0
+    train_dataset = dataset
+    eval_dataset = dataset
+    class_weights = None
 
-    train_dataset = [dataset[int(index)] for index in train_idx]
-    eval_dataset = [dataset[int(index)] for index in eval_idx]
+    if use_label_supervision:
+        labels = [sample[2] for sample in dataset]
+        indices = np.arange(len(dataset))
+        try:
+            train_idx, eval_idx = train_test_split(
+                indices,
+                test_size=eval_split,
+                random_state=seed,
+                shuffle=True,
+                stratify=labels,
+            )
+        except ValueError:
+            logging.warning('Falling back to a non-stratified subject split because one or more classes are too small.')
+            train_idx, eval_idx = train_test_split(
+                indices,
+                test_size=eval_split,
+                random_state=seed,
+                shuffle=True,
+            )
 
-    class_counts = np.bincount([sample[2] for sample in train_dataset], minlength=model.num_classes).astype(np.float32)
-    class_weights = np.ones(model.num_classes, dtype=np.float32)
-    non_zero = class_counts > 0
-    class_weights[non_zero] = class_counts[non_zero].sum() / (non_zero.sum() * class_counts[non_zero])
-    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        train_dataset = [dataset[int(index)] for index in train_idx]
+        eval_dataset = [dataset[int(index)] for index in eval_idx]
 
-    logging.info(f"Subject split: {len(train_dataset)} train / {len(eval_dataset)} eval (held-out)")
+        class_counts = np.bincount([sample[2] for sample in train_dataset], minlength=model.num_classes).astype(np.float32)
+        class_weights = np.ones(model.num_classes, dtype=np.float32)
+        non_zero = class_counts > 0
+        class_weights[non_zero] = class_counts[non_zero].sum() / (non_zero.sum() * class_counts[non_zero])
+        class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+
+        logging.info(f"Subject split: {len(train_dataset)} train / {len(eval_dataset)} eval (held-out)")
+        logging.info(f"Classification loss weight: {classification_weight:.3f}")
+    else:
+        logging.info('Using the original DBGDGM objective by default (edge reconstruction only).')
+        logging.info('Diagnosis performance should be read from downstream embedding evaluation, not the training loss.')
+
     logging.info(f"Early stopping patience: {early_stopping_patience} eval checks "
                  f"(= {early_stopping_patience * eval_every} epochs without improvement)")
-    logging.info(f"Classification loss weight: {classification_weight:.3f}")
 
     # ── Training loop ────────────────────────────────────────────────────────
     for epoch in range(start_epoch, num_epochs):
@@ -225,7 +244,8 @@ def train(model, dataset,
                         + 0.1  * batch_loss['kld_alpha']
                         + 0.1  * batch_loss['kld_beta']
                         + 0.01 * batch_loss['kld_phi']) / len(batch_graphs)
-                loss = loss + classification_weight * (batch_loss['classification'] / len(batch_graphs))
+                if use_label_supervision:
+                    loss = loss + classification_weight * (batch_loss['classification'] / len(batch_graphs))
 
             scaler.scale(loss).backward()
             if max_grad_norm is not None and max_grad_norm > 0:
@@ -250,28 +270,70 @@ def train(model, dataset,
                     eval_dataset,
                     valid_prop=valid_prop,
                     test_prop=test_prop)
-                label_metrics = model.predict_label_metrics(
-                    eval_dataset,
-                    valid_prop=valid_prop,
-                    test_prop=test_prop,
+                diagnosis_metrics = None
+                if use_label_supervision:
+                    label_metrics = model.predict_label_metrics(
+                        eval_dataset,
+                        valid_prop=valid_prop,
+                        test_prop=test_prop,
+                    )
+                else:
+                    label_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': float('nan'),
+                        'balanced_accuracy': float('nan'),
+                        'macro_f1': float('nan'),
+                        'macro_auc_ovr': float('nan'),
+                    }
+                    diagnosis_embeddings = model.predict_embeddings(
+                        dataset,
+                        valid_prop=valid_prop,
+                        test_prop=test_prop,
+                    )
+                    try:
+                        diagnosis_metrics = evaluate_diagnosis_from_embeddings(
+                            diagnosis_embeddings,
+                            dataset,
+                            seed=seed,
+                        )
+                    except Exception as exc:
+                        diagnosis_metrics = {'error': str(exc)}
+
+            if use_label_supervision:
+                logging.info(
+                    f"Epoch {epoch} [eval | {len(eval_dataset)} held-out subjects] | "
+                    f"edge train nll {edge_nll['train']:.4f} aucroc {edge_aucroc['train']:.4f} ap {edge_ap['train']:.4f} | "
+                    f"edge valid nll {edge_nll['valid']:.4f} aucroc {edge_aucroc['valid']:.4f} ap {edge_ap['valid']:.4f} | "
+                    f"edge test nll {edge_nll['test']:.4f} aucroc {edge_aucroc['test']:.4f} ap {edge_ap['test']:.4f} | "
+                    f"label loss {label_metrics['loss']:.4f} acc {label_metrics['accuracy']:.4f} "
+                    f"bal_acc {label_metrics['balanced_accuracy']:.4f} macro_f1 {label_metrics['macro_f1']:.4f}"
                 )
+            else:
+                logging.info(
+                    f"Epoch {epoch} [eval | all subjects] | "
+                    f"edge train nll {edge_nll['train']:.4f} aucroc {edge_aucroc['train']:.4f} ap {edge_ap['train']:.4f} | "
+                    f"edge valid nll {edge_nll['valid']:.4f} aucroc {edge_aucroc['valid']:.4f} ap {edge_ap['valid']:.4f} | "
+                    f"edge test nll {edge_nll['test']:.4f} aucroc {edge_aucroc['test']:.4f} ap {edge_ap['test']:.4f}"
+                )
+                if diagnosis_metrics is not None:
+                    if 'error' in diagnosis_metrics:
+                        logging.warning(f"Diagnosis evaluation unavailable: {diagnosis_metrics['error']}")
+                    else:
+                        logging.info(
+                            f"Epoch {epoch} [diagnosis downstream CV] | "
+                            f"acc {diagnosis_metrics['accuracy_mean']:.4f} +/- {diagnosis_metrics['accuracy_std']:.4f} | "
+                            f"bal_acc {diagnosis_metrics['balanced_accuracy_mean']:.4f} +/- {diagnosis_metrics['balanced_accuracy_std']:.4f} | "
+                            f"macro_f1 {diagnosis_metrics['macro_f1_mean']:.4f} +/- {diagnosis_metrics['macro_f1_std']:.4f}"
+                        )
 
-            logging.info(
-                f"Epoch {epoch} [eval | {len(eval_dataset)} held-out subjects] | "
-                f"edge train nll {edge_nll['train']:.4f} aucroc {edge_aucroc['train']:.4f} ap {edge_ap['train']:.4f} | "
-                f"edge valid nll {edge_nll['valid']:.4f} aucroc {edge_aucroc['valid']:.4f} ap {edge_ap['valid']:.4f} | "
-                f"edge test nll {edge_nll['test']:.4f} aucroc {edge_aucroc['test']:.4f} ap {edge_ap['test']:.4f} | "
-                f"label loss {label_metrics['loss']:.4f} acc {label_metrics['accuracy']:.4f} "
-                f"bal_acc {label_metrics['balanced_accuracy']:.4f} macro_f1 {label_metrics['macro_f1']:.4f}"
-            )
-
-            save_valid = label_metrics['balanced_accuracy'] > best_label_score
+            save_valid = label_metrics['balanced_accuracy'] > best_label_score if use_label_supervision else edge_nll['valid'] < best_nll
             save_train = edge_nll['train'] < best_nll_train
 
             # Compute embeddings once if any checkpoint needs saving
             if save_valid or save_train:
                 with torch.no_grad():
-                    embeddings = model.predict_embeddings(train_dataset,
+                    embedding_dataset = train_dataset if use_label_supervision else dataset
+                    embeddings = model.predict_embeddings(embedding_dataset,
                                                           valid_prop=valid_prop,
                                                           test_prop=test_prop)
             else:
@@ -279,23 +341,33 @@ def train(model, dataset,
 
             # ── Best-valid checkpoint ────────────────────────────────────────
             if save_valid:
-                logging.info(
-                    f"✓ New best held-out balanced accuracy: {label_metrics['balanced_accuracy']:.4f} "
-                    f"(was {best_label_score:.4f}). Saving best-valid checkpoint."
-                )
+                if use_label_supervision:
+                    logging.info(
+                        f"✓ New best held-out balanced accuracy: {label_metrics['balanced_accuracy']:.4f} "
+                        f"(was {best_label_score:.4f}). Saving best-valid checkpoint."
+                    )
+                else:
+                    logging.info(
+                        f"✓ New best held-out valid NLL: {edge_nll['valid']:.4f} "
+                        f"(was {best_nll:.4f}). Saving best-valid checkpoint."
+                    )
                 _save_checkpoint(save_path, "checkpoint_best_valid.pt",
                                   model, optimizer, scaler,
                                   epoch, temp, learning_rate,
                                   best_nll, best_nll_train, best_label_score,
-                                  edge_nll, edge_aucroc, edge_ap, label_metrics,
+                                  edge_nll, edge_aucroc, edge_ap, label_metrics, diagnosis_metrics,
                                   embeddings, label="best_valid")
                 if on_checkpoint: on_checkpoint()
                 best_nll = edge_nll['valid']
-                best_label_score = label_metrics['balanced_accuracy']
+                if use_label_supervision:
+                    best_label_score = label_metrics['balanced_accuracy']
                 patience_counter = 0   # reset early-stopping counter
             else:
                 patience_counter += 1
-                logging.info(f"No held-out label improvement. Patience: {patience_counter}/{early_stopping_patience}")
+                if use_label_supervision:
+                    logging.info(f"No held-out label improvement. Patience: {patience_counter}/{early_stopping_patience}")
+                else:
+                    logging.info(f"No held-out valid NLL improvement. Patience: {patience_counter}/{early_stopping_patience}")
 
             # ── Best-train checkpoint ────────────────────────────────────────
             if save_train:
@@ -304,7 +376,7 @@ def train(model, dataset,
                                   model, optimizer, scaler,
                                   epoch, temp, learning_rate,
                                   best_nll, best_nll_train, best_label_score,
-                                  edge_nll, edge_aucroc, edge_ap, label_metrics,
+                                  edge_nll, edge_aucroc, edge_ap, label_metrics, diagnosis_metrics,
                                   embeddings, label="best_train")
                 if on_checkpoint: on_checkpoint()
                 best_nll_train = edge_nll['train']
@@ -314,17 +386,24 @@ def train(model, dataset,
                               model, optimizer, scaler,
                               epoch, temp, learning_rate,
                               best_nll, best_nll_train, best_label_score,
-                              edge_nll, edge_aucroc, edge_ap, label_metrics,
+                              edge_nll, edge_aucroc, edge_ap, label_metrics, diagnosis_metrics,
                               embeddings, label="latest")
             if on_checkpoint: on_checkpoint()
 
             # ── Early stopping check ─────────────────────────────────────────
             if patience_counter >= early_stopping_patience:
-                logging.info(
-                    f"Early stopping triggered at epoch {epoch}. "
-                    f"No held-out label improvement for {early_stopping_patience} consecutive eval checks "
-                    f"({patience_counter * eval_every} epochs)."
-                )
+                if use_label_supervision:
+                    logging.info(
+                        f"Early stopping triggered at epoch {epoch}. "
+                        f"No held-out label improvement for {early_stopping_patience} consecutive eval checks "
+                        f"({patience_counter * eval_every} epochs)."
+                    )
+                else:
+                    logging.info(
+                        f"Early stopping triggered at epoch {epoch}. "
+                        f"No held-out valid NLL improvement for {early_stopping_patience} consecutive eval checks "
+                        f"({patience_counter * eval_every} epochs)."
+                    )
                 early_stopped = True
                 break
 

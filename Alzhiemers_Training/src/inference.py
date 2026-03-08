@@ -3,6 +3,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .diagnosis import evaluate_diagnosis_from_embeddings
+
 
 def inference(model,
               dataset,
@@ -45,21 +47,27 @@ def inference(model,
         valid_prop=valid_prop,
         test_prop=test_prop
     )
-    label_metrics = model.predict_label_metrics(
-        dataset,
-        valid_prop=valid_prop,
-        test_prop=test_prop,
-    )
+
+    try:
+        diagnosis_metrics = evaluate_diagnosis_from_embeddings(embeddings, dataset)
+    except Exception as exc:
+        diagnosis_metrics = {'error': str(exc)}
 
     report = (
         f"edge train nll {edge_nll['train']} aucroc {edge_aucroc['train']} ap {edge_ap['train']} | "
         f"edge valid nll {edge_nll['valid']} aucroc {edge_aucroc['valid']} ap {edge_ap['valid']} | "
-        f"edge test nll {edge_nll['test']} aucroc {edge_aucroc['test']} ap {edge_ap['test']} | "
-        f"label loss {label_metrics['loss']} acc {label_metrics['accuracy']} "
-        f"bal_acc {label_metrics['balanced_accuracy']} macro_f1 {label_metrics['macro_f1']}"
+        f"edge test nll {edge_nll['test']} aucroc {edge_aucroc['test']} ap {edge_ap['test']}"
     )
 
     print(report)
+    if 'error' in diagnosis_metrics:
+        print(f"diagnosis evaluation unavailable: {diagnosis_metrics['error']}")
+    else:
+        print(
+            f"diagnosis accuracy {diagnosis_metrics['accuracy_mean']:.4f} +/- {diagnosis_metrics['accuracy_std']:.4f} | "
+            f"bal_acc {diagnosis_metrics['balanced_accuracy_mean']:.4f} +/- {diagnosis_metrics['balanced_accuracy_std']:.4f} | "
+            f"macro_f1 {diagnosis_metrics['macro_f1_mean']:.4f} +/- {diagnosis_metrics['macro_f1_std']:.4f}"
+        )
     print("Saving embeddings.")
 
     try:
@@ -75,7 +83,7 @@ def inference(model,
                 'edge_nll': edge_nll,
                 'edge_aucroc': edge_aucroc,
                 'edge_ap': edge_ap,
-                'label_metrics': label_metrics,
+                'diagnosis_metrics': diagnosis_metrics,
                 'embeddings': embeddings
             })
 

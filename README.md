@@ -33,35 +33,53 @@ chmod +x Alzhiemers_Training/setup_droplet.sh Alzhiemers_Training/train_do.sh
 ./Alzhiemers_Training/setup_droplet.sh
 ```
 
-### 5. Copy data and starting checkpoints to the droplet
+### 5. Copy the dataset from Windows PowerShell with fast SCP
 
-From your local machine, sync the dataset and any checkpoint you want to resume from:
+Use PowerShell on Windows, not WSL. The fast path is to create one tar archive locally and upload that single archive with `scp`. That avoids the file-by-file overhead of `scp -r`, which is the main reason recursive SCP feels slow on large datasets.
 
-```bash
-rsync -avz --progress \
-	H:/Personal/Internships/WeKan/DBGDGM_Improvements/Alzhiemers_Training/data/ \
-	root@159.223.209.77:/root/DBGDGM_Improvements/Alzhiemers_Training/data/
+Requirements on Windows:
 
-rsync -avz --progress \
-	H:/Personal/Internships/WeKan/DBGDGM_Improvements/Alzhiemers_Training/models/ \
-	root@159.223.209.77:/root/DBGDGM_Improvements/Alzhiemers_Training/models/
+- `scp.exe` from the OpenSSH Client feature
+- `tar.exe` available in PowerShell
+
+Fast upload and remote extract in one step:
+
+```powershell
+.\Alzhiemers_Training\upload_data_scp.ps1 `
+  159.223.209.77 `
+  -Identity "$env:USERPROFILE\.ssh\id_ed25519" `
+  -ExtractRemote
 ```
 
-If resuming from an existing checkpoint, place it on the volume first:
+If your SSH key is already the default one used by OpenSSH, run:
 
-```bash
-mkdir -p /mnt/results/models_oasis_1
-cp Alzhiemers_Training/models/checkpoint_latest.pt /mnt/results/models_oasis_1/checkpoint_best_valid.pt
+```powershell
+.\Alzhiemers_Training\upload_data_scp.ps1 159.223.209.77 -ExtractRemote
+```
+
+If you want the copy step itself to stay strictly `scp` only, run without `-ExtractRemote`:
+
+```powershell
+.\Alzhiemers_Training\upload_data_scp.ps1 `
+  159.223.209.77 `
+  -Identity "$env:USERPROFILE\.ssh\id_ed25519"
+```
+
+That command uploads one tarball with `scp` and then prints the exact `ssh` command needed to extract it on the droplet.
+
+The slower baseline, kept here only for comparison, is direct recursive copy:
+
+```powershell
+scp -r .\Alzhiemers_Training\data root@159.223.209.77:/root/DBGDGM_Improvements/Alzhiemers_Training/
 ```
 
 ### 6. Start training in tmux
 
 ```bash
-./Alzhiemers_Training/train_do.sh \
-	--resume-from /mnt/results/models_oasis_1/checkpoint_best_valid.pt
+./Alzhiemers_Training/train_do.sh
 ```
 
-This launches training inside a tmux session named `dbgdgm_train`, so you can disconnect safely.
+This starts a fresh training run inside a tmux session named `dbgdgm_train`, so you can disconnect safely.
 
 ### 7. Reattach or detach later
 

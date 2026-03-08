@@ -49,14 +49,21 @@ git clone https://github.com/Nishanth1812/DBGDGM_Improvements.git
 cd DBGDGM_Improvements
 ```
 
-Then rsync data and checkpoint from your local machine (Git Bash / WSL):
+Then upload the dataset from Windows PowerShell with the faster SCP helper. It sends one tar archive instead of recursively copying thousands of files:
+
+```powershell
+.\Alzhiemers_Training\upload_data_scp.ps1 `
+    159.203.28.232 `
+    -Identity "$env:USERPROFILE\.ssh\id_ed25519" `
+    -ExtractRemote
+```
+
+If you want the copy step to remain `scp` only, run the same command without `-ExtractRemote`. The script will print the exact remote `tar -xf` command to run afterward.
+
+For checkpoints or later incremental syncs, continue using rsync:
 
 ```bash
 rsync -avz --progress \
-    H:/Personal/Internships/WeKan/DBGDGM_Improvements/Alzhiemers_Training/data/ \
-    root@159.203.28.232:/root/DBGDGM_Improvements/Alzhiemers_Training/data/
-
-rsync -avz \
     H:/Personal/Internships/WeKan/DBGDGM_Improvements/Alzhiemers_Training/models/ \
     root@159.203.28.232:/root/DBGDGM_Improvements/Alzhiemers_Training/models/
 ```

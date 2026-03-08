@@ -21,7 +21,7 @@ LOSS_KEYS = ['nll', 'kld_z', 'kld_alpha', 'kld_beta', 'kld_phi', 'classification
 
 class Model(nn.Module):
     """
-    DBGDGM model definition with Improvements (Fix 1 and Fix 2).
+    DBGDGM model definition.
 
     Attributes:
     ------------
@@ -66,7 +66,6 @@ class Model(nn.Module):
         self.phi_std = nn.Sequential(nn.Linear(self.embedding_dim, self.embedding_dim), nn.Softplus())
         self.nn_pi = nn.Linear(self.embedding_dim, self.categorical_dim, bias=False)
 
-        # Fix 1: Input size remains 2*embedding_dim, second slot mapped to neighbor aggregates
         self.rnn_nodes = nn.GRU(2 * self.embedding_dim, self.embedding_dim, num_layers=1, bias=True)
         self.rnn_comms = nn.GRU(2 * self.embedding_dim, self.embedding_dim, num_layers=1, bias=True)
 
@@ -85,18 +84,6 @@ class Model(nn.Module):
             nn.Linear(self.embedding_dim, self.num_classes),
         )
 
-        # Fix 2: Learned Transition Priors for temporal embedding shift
-        self.phi_transition = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-            nn.Tanh(),
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-        )
-        self.beta_transition = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-            nn.Tanh(),
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-        )
-
         self.init_emb()
 
     def init_emb(self):
@@ -106,40 +93,8 @@ class Model(nn.Module):
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias.data)
 
-    def _aggregate_neighbors(self, phi: torch.Tensor, graph) -> torch.Tensor:
-        """Fix 1: Aggregates embeddings of neighbors via vectorized scatter_add."""
-        num_nodes = phi.shape[0]
-
-        edge_index = snapshot_edge_tensor(graph, device=self.device)
-        if edge_index.numel() == 0:
-            return phi.clone()
-
-        src = torch.cat((edge_index[:, 0], edge_index[:, 1]))
-        dst = torch.cat((edge_index[:, 1], edge_index[:, 0]))
-
-        # Scatter-add neighbor embeddings then normalise by degree
-        agg = torch.zeros_like(phi)
-        agg.scatter_add_(0, dst.unsqueeze(1).expand(-1, phi.shape[1]), phi[src])
-
-        degree = torch.zeros(num_nodes, device=self.device)
-        degree.scatter_add_(0, dst, torch.ones(len(dst), device=self.device))
-
-        # Isolated nodes (degree==0) fall back to their own embedding
-        isolated = (degree == 0)
-        agg[isolated] = phi[isolated]
-        degree = degree.clamp(min=1).unsqueeze(1)
-
-        return agg / degree
-
-
-    def _update_hidden_states(self, phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=None):
-        """Fix 1 implementation feeding graph neighbor means to Node GRU."""
-        if graph is not None:
-            neighbor_context = self._aggregate_neighbors(phi_prior_mean, graph)
-        else:
-            neighbor_context = phi_prior_mean
-
-        nodes_in = torch.cat([phi_prior_mean, neighbor_context], dim=-1).view(1, self.num_nodes, 2 * self.embedding_dim)
+    def _update_hidden_states(self, phi_prior_mean, beta_prior_mean, h_phi, h_beta):
+        nodes_in = torch.cat([phi_prior_mean, phi_prior_mean], dim=-1).view(1, self.num_nodes, 2 * self.embedding_dim)
         _, h_phi = self.rnn_nodes(nodes_in, h_phi)
 
         comms_in = torch.cat([beta_prior_mean, beta_prior_mean], dim=-1).view(1, self.categorical_dim, 2 * self.embedding_dim)
@@ -207,7 +162,7 @@ class Model(nn.Module):
 
         for snapshot_idx in range(0, train_time):
             graph = batch_graphs[snapshot_idx]
-            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
+            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta)
 
             batch = snapshot_edge_tensor(graph, device=self.device)
             if batch.numel() == 0:
@@ -230,8 +185,8 @@ class Model(nn.Module):
             loss['kld_beta'] += kld_gauss(beta_sample, beta_std_t, beta_prior_mean, self.gamma)
             loss['kld_phi'] += kld_gauss(phi_sample, phi_std_t, phi_prior_mean, self.sigma)
 
-            beta_prior_mean = self.beta_transition(beta_sample)
-            phi_prior_mean = self.phi_transition(phi_sample)
+            beta_prior_mean = beta_sample
+            phi_prior_mean = phi_sample
             edge_counter += c.shape[0]
 
         if edge_counter == 0:
@@ -258,11 +213,10 @@ class Model(nn.Module):
         total_steps = train_time if use_train_snapshots_only else len(batch_graphs)
 
         for snapshot_idx in range(total_steps):
-            graph = batch_graphs[snapshot_idx]
-            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
+            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta)
             (_, beta_mean, _), (_, phi_mean, _) = self._sample_embeddings(h_phi, h_beta)
-            beta_prior_mean = self.beta_transition(beta_mean)
-            phi_prior_mean = self.phi_transition(phi_mean)
+            beta_prior_mean = beta_mean
+            phi_prior_mean = phi_mean
 
         return self._subject_representation(alpha_n, h_phi, h_beta)
 
@@ -348,7 +302,7 @@ class Model(nn.Module):
 
         for i, graph in enumerate(batch_graphs):
             status = get_status(i, train_time, valid_time)
-            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
+            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta)
             (_, beta_mean, _), (_, phi_mean, _) = self._sample_embeddings(h_phi, h_beta)
 
             pos_edges, neg_edges = sample_pos_neg_edges(graph)
@@ -364,9 +318,8 @@ class Model(nn.Module):
             label[status] = np.hstack([label[status], np.ones(len(p_c_pos_gt)), np.zeros(len(p_c_neg_gt))])
             nll[status] = np.hstack([nll[status], bce])
 
-            # Fix 2
-            beta_prior_mean = self.beta_transition(beta_mean)
-            phi_prior_mean = self.phi_transition(phi_mean)
+            beta_prior_mean = beta_mean
+            phi_prior_mean = phi_mean
 
         return pred, label, nll
 
@@ -400,7 +353,7 @@ class Model(nn.Module):
         for i, graph in enumerate(batch_graphs):
             status = get_status(i, train_time, valid_time)
 
-            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta, graph=graph)
+            h_phi, h_beta = self._update_hidden_states(phi_prior_mean, beta_prior_mean, h_phi, h_beta)
 
             (_, beta_mean, _), (_, phi_mean, _) = self._sample_embeddings(h_phi, h_beta)
 
@@ -411,8 +364,7 @@ class Model(nn.Module):
             embeddings['beta_embeddings'][status].append(beta_mean.cpu().detach().numpy())
             embeddings['phi_embeddings'][status].append(phi_mean.cpu().detach().numpy())
 
-            # Fix 2: Updates transition
-            beta_prior_mean = self.beta_transition(beta_mean)
-            phi_prior_mean = self.phi_transition(phi_mean)
+            beta_prior_mean = beta_mean
+            phi_prior_mean = phi_mean
 
         return embeddings

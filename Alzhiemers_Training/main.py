@@ -165,7 +165,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', default=None, type=int)
     parser.add_argument('--learning-rate', default=1e-4, type=float)
     parser.add_argument('--weight-decay', default=1e-4, type=float)
-    parser.add_argument('--classification-weight', default=1.0, type=float)
+    parser.add_argument('--classification-weight', default=0.0, type=float,
+                        help='Auxiliary diagnosis loss weight. Leave at 0.0 to match the original DBGDGM objective.')
     parser.add_argument('--num-epochs', default=301, type=int)
     parser.add_argument('--anneal-rate', default=3e-4, type=float)
     parser.add_argument('--temp-min', default=0.05, type=float)
