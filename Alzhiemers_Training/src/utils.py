@@ -17,7 +17,11 @@ def get_snapshot_num_nodes(snapshot) -> int:
 
 def snapshot_edge_array(snapshot) -> np.ndarray:
     if isinstance(snapshot, dict):
-        edges = np.asarray(snapshot['edge_index'], dtype=np.int64)
+        cached_tensor = snapshot.get('edge_index_tensor')
+        if isinstance(cached_tensor, torch.Tensor):
+            edges = cached_tensor.detach().cpu().numpy()
+        else:
+            edges = np.asarray(snapshot['edge_index'], dtype=np.int64)
     else:
         edges = np.asarray(list(snapshot.edges()), dtype=np.int64)
 
@@ -28,10 +32,39 @@ def snapshot_edge_array(snapshot) -> np.ndarray:
 
 
 def snapshot_edge_tensor(snapshot, device=None) -> torch.Tensor:
-    edges = torch.as_tensor(snapshot_edge_array(snapshot), dtype=torch.long)
+    if isinstance(snapshot, dict):
+        edges = snapshot.get('edge_index_tensor')
+        if not isinstance(edges, torch.Tensor):
+            edges = torch.as_tensor(np.asarray(snapshot['edge_index'], dtype=np.int64), dtype=torch.long).contiguous()
+            snapshot['edge_index_tensor'] = edges
+    else:
+        edges = torch.as_tensor(snapshot_edge_array(snapshot), dtype=torch.long).contiguous()
+
     if device is not None:
-        edges = edges.to(device)
+        non_blocking = edges.device.type == 'cpu' and getattr(edges, 'is_pinned', lambda: False)()
+        edges = edges.to(device, non_blocking=non_blocking)
     return edges
+
+
+def prepare_dataset_tensors(dataset, pin_memory: bool = False):
+    for _, snapshots, _ in dataset:
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+
+            edge_tensor = snapshot.get('edge_index_tensor')
+            if not isinstance(edge_tensor, torch.Tensor):
+                edge_tensor = torch.as_tensor(np.asarray(snapshot['edge_index'], dtype=np.int64), dtype=torch.long).contiguous()
+
+            if pin_memory and edge_tensor.device.type == 'cpu' and not edge_tensor.is_pinned():
+                try:
+                    edge_tensor = edge_tensor.pin_memory()
+                except RuntimeError:
+                    pass
+
+            snapshot['edge_index_tensor'] = edge_tensor
+
+    return dataset
 
 
 def sample_pos_neg_edges(graph: nx.Graph, num_samples: int = 1) -> Tuple[List[Tuple], List[Tuple]]:

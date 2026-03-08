@@ -17,6 +17,15 @@ git clone https://github.com/Nishanth1812/DBGDGM_Improvements.git
 cd DBGDGM_Improvements
 ```
 
+If the repo is already present on the droplet, update it instead:
+
+```bash
+cd /root/DBGDGM_Improvements
+git pull origin main
+```
+
+If you have just pulled the latest changes, continue with the next steps below in order. The code update alone is not enough because the droplet still needs the raw OASIS dataset and a fresh cache.
+
 ### 3. Point the project to the attached volume
 
 The training scripts use `/mnt/trainingresults`, so map that path to the attached `results` volume:
@@ -26,12 +35,14 @@ mkdir -p /mnt/results
 ln -sfn /mnt/results /mnt/trainingresults
 ```
 
-### 4. Run the one-time setup
+### 4. Run the setup
 
 ```bash
 chmod +x Alzhiemers_Training/setup_droplet.sh Alzhiemers_Training/train_do.sh
 ./Alzhiemers_Training/setup_droplet.sh
 ```
+
+Run this after pulling new code as well, not just on the first droplet boot.
 
 ### 5. Copy the dataset from Windows PowerShell with fast SCP
 
@@ -67,13 +78,44 @@ If you want the copy step itself to stay strictly `scp` only, run without `-Extr
 
 That command uploads one tarball with `scp` and then prints the exact `ssh` command needed to extract it on the droplet.
 
+If you have already pulled the latest code to the droplet, this dataset upload is the next required step.
+
 The slower baseline, kept here only for comparison, is direct recursive copy:
 
 ```powershell
 scp -r .\Alzhiemers_Training\data root@159.223.209.77:/root/DBGDGM_Improvements/Alzhiemers_Training/
 ```
 
-### 6. Start training in tmux
+### 6. Reset old OASIS artifacts before a fresh run
+
+The corrected pipeline now builds subject-level OASIS samples. Old scan-level caches and checkpoints are not compatible with the new code, so do not resume them.
+
+On the droplet, remove the old OASIS cache and move old checkpoints out of the way before training:
+
+```bash
+mkdir -p /mnt/trainingresults/backup_pre_subject_fix
+mv /mnt/trainingresults/models_oasis_1 /mnt/trainingresults/backup_pre_subject_fix/ 2>/dev/null || true
+rm -f /mnt/trainingresults/cache/oasis/oasis*.pkl 2>/dev/null || true
+```
+
+After a fresh `git pull`, always do this cleanup before training if the droplet has older OASIS outputs.
+
+Verify the raw dataset exists in the repo path after upload:
+
+```bash
+find /root/DBGDGM_Improvements/Alzhiemers_Training/data -maxdepth 1 -type d
+```
+
+You should see the four class folders:
+
+- `Non Demented`
+- `Very mild Dementia`
+- `Mild Dementia`
+- `Moderate Dementia`
+
+If those folders are missing, do not start training yet.
+
+### 7. Start training in tmux
 
 ```bash
 ./Alzhiemers_Training/train_do.sh
@@ -81,7 +123,33 @@ scp -r .\Alzhiemers_Training\data root@159.223.209.77:/root/DBGDGM_Improvements/
 
 This starts a fresh training run inside a tmux session named `dbgdgm_train`, so you can disconnect safely.
 
-### 7. Reattach or detach later
+Do not pass `--resume-from` with checkpoints from the previous pipeline.
+
+This is the correct command to run immediately after:
+
+1. `git pull origin main`
+2. dataset upload
+3. cache/checkpoint cleanup
+
+### 8. Run inference for realistic diagnosis metrics
+
+After training completes, run inference to save embeddings and compute subject-level downstream diagnosis metrics:
+
+```bash
+cd /root/DBGDGM_Improvements/Alzhiemers_Training
+/root/DBGDGM_Improvements/.venv/bin/python main.py \
+  --dataset oasis \
+  --categorical-dim 3 \
+  --trial 1 \
+  --gpu 0 \
+  inference
+```
+
+This writes `results_inference.npy` and prints diagnosis metrics computed from subject embeddings with repeated stratified evaluation.
+
+Run this only after training has finished successfully.
+
+### 9. Reattach or detach later
 
 ```bash
 tmux attach -t dbgdgm_train
@@ -89,6 +157,6 @@ tmux attach -t dbgdgm_train
 
 Detach without stopping training with `Ctrl+B`, then `D`.
 
-### 8. Where results are saved
+### 10. Where results are saved
 
-Outputs are written to the attached volume under `/mnt/results`, including checkpoints and logs.
+Outputs are written to the attached volume under `/mnt/results`, including checkpoints, logs, and the OASIS cache.

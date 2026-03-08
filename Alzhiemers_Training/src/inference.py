@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from .diagnosis import evaluate_diagnosis_from_embeddings
+from .utils import prepare_dataset_tensors
 
 
 def inference(model,
@@ -39,6 +40,9 @@ def inference(model,
 
     model.to(device)
     model.eval()
+
+    if dataset and isinstance(dataset[0][1][0], dict):
+        prepare_dataset_tensors(dataset, pin_memory=device.type == 'cuda')
 
     embeddings = model.predict_embeddings(dataset, valid_prop=valid_prop, test_prop=test_prop)
 

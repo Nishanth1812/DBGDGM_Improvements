@@ -10,6 +10,7 @@ from sklearn.model_selection import train_test_split
 
 from .dataset import data_loader
 from .diagnosis import evaluate_diagnosis_from_embeddings
+from .utils import prepare_dataset_tensors
 
 
 def _save_checkpoint(path, filename, model, optimizer, scaler,
@@ -120,6 +121,10 @@ def train(model, dataset,
 
     # Move model to device
     model.to(device)
+
+    if dataset and isinstance(dataset[0][1][0], dict):
+        prepare_dataset_tensors(dataset, pin_memory=device.type == 'cuda')
+        logging.info('Prepared cached edge tensors for the dataset to reduce CPU overhead during training.')
 
     # Track best losses
     best_nll = float('inf')
