@@ -61,7 +61,7 @@ def main(args):
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
 
-    batch_size = args.batch_size if args.batch_size is not None else (64 if is_h100 else 8)
+    batch_size = args.batch_size if args.batch_size is not None else (32 if is_h100 else 8)
     amp_dtype = args.amp_dtype if args.amp_dtype != 'auto' else ('bf16' if is_h100 else 'fp16')
 
     # Hyperparameters
