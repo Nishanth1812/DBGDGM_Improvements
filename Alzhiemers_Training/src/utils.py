@@ -67,7 +67,7 @@ def prepare_dataset_tensors(dataset, pin_memory: bool = False):
     return dataset
 
 
-def sample_pos_neg_edges(graph: nx.Graph, num_samples: int = 1) -> Tuple[List[Tuple], List[Tuple]]:
+def sample_pos_neg_edges(graph, num_samples: int = 1) -> Tuple[List[Tuple], List[Tuple]]:
     """
     Samples positive and negative edges from a networkx graph for the evaluation of a graph representation learning algorithm.
 
@@ -99,14 +99,14 @@ def sample_pos_neg_edges(graph: nx.Graph, num_samples: int = 1) -> Tuple[List[Tu
     # Calculate the set of negative edges by subtracting the positive edges from all possible edges
     all_neg_edges = all_edges - pos_edges
 
-    if num_samples > len(all_neg_edges):
-        raise ValueError("The number of requested samples exceeds the number of available negative edges.")
+    if len(pos_edges) > len(all_neg_edges):
+        raise ValueError("Not enough negative edges are available to match the positive edge count.")
 
     # Sample the same number of negative edges as there are positive edges, `num_samples` times
     sampled_neg_edges = [random.sample(list(all_neg_edges), len(pos_edges)) for _ in range(num_samples)]
 
     # Repeat the list of positive edges `num_samples` times
-    sampled_pos_edges = [list(graph.edges()) for _ in range(num_samples)]
+    sampled_pos_edges = [list(pos_edges) for _ in range(num_samples)]
 
     # Flatten the lists of sampled edges
     return list(itertools.chain.from_iterable(sampled_pos_edges)), \
