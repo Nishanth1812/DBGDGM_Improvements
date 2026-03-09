@@ -10,6 +10,7 @@ import torch
 from src.dataset import load_dataset
 from src.inference import inference
 from src.model import Model
+from src.smri_model import SmriModel
 from src.train import train
 
 def main(args):
@@ -21,7 +22,10 @@ def main(args):
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(logging.Formatter(log_format))
 
-    file_handler = logging.FileHandler(f'fMRI_{args.dataset}_{args.trial}.log', mode='a')
+    resolved_data_mode = args.data_mode if args.data_mode != 'auto' else ('smri' if args.dataset == 'oasis' else 'graph')
+    log_prefix = 'smri' if resolved_data_mode == 'smri' else 'fmri'
+
+    file_handler = logging.FileHandler(f'{log_prefix}_{args.dataset}_{args.trial}.log', mode='a')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter(log_format))
 
@@ -67,11 +71,14 @@ def main(args):
     # Hyperparameters
     dataset_args = dict(
         dataset=args.dataset,
+        data_mode=resolved_data_mode,
         window_size=args.window_size,
         window_stride=args.window_stride,
         measure="correlation",
         top_percent=10, # Adjusted for Oasis
-        grid_size=args.grid_size
+        grid_size=args.grid_size,
+        image_size=args.image_size,
+        num_slices=args.num_slices,
     )
 
     model_args = dict(
@@ -80,6 +87,10 @@ def main(args):
         categorical_dim=args.categorical_dim,
         embedding_dim=args.embedding_dim
     )
+
+    resolved_classification_weight = args.classification_weight
+    if resolved_classification_weight is None:
+        resolved_classification_weight = 1.0 if resolved_data_mode == 'smri' else 0.0
 
     train_args = dict(
         num_epochs=args.num_epochs,
@@ -96,7 +107,7 @@ def main(args):
         eval_every=args.eval_every,
         early_stopping_patience=args.early_stopping_patience,
         eval_split=args.subject_eval_prop,
-        classification_weight=args.classification_weight,
+        classification_weight=resolved_classification_weight,
         amp_dtype=amp_dtype,
         max_grad_norm=args.max_grad_norm,
         seed=args.seed,
@@ -123,20 +134,34 @@ def main(args):
     # Dataset
     logging.info('Loading data.')
     dataset = load_dataset(**dataset_args, data_dir=data_dir)
-    num_subjects, num_nodes = len(dataset), dataset[0][1][0]['num_nodes']
+    if not dataset:
+        raise ValueError('Dataset is empty. Check the OASIS data directory and preprocessing configuration.')
+
+    num_subjects = len(dataset)
     num_classes = len({sample[2] for sample in dataset})
-    logging.info(f'{num_subjects} subjects with {num_nodes} nodes each.')
+
+    if resolved_data_mode == 'smri':
+        input_shape = dataset[0][1]['volume'].shape
+        logging.info(f'{num_subjects} subjects with sMRI volume shape {input_shape}.')
+    else:
+        num_nodes = dataset[0][1][0]['num_nodes']
+        logging.info(f'{num_subjects} subjects with {num_nodes} nodes each.')
+
     logging.info(
-        'Resolved training config | batch_size=%s amp_dtype=%s learning_rate=%s weight_decay=%s classification_weight=%s',
+        'Resolved training config | data_mode=%s batch_size=%s amp_dtype=%s learning_rate=%s weight_decay=%s classification_weight=%s',
+        resolved_data_mode,
         batch_size,
         amp_dtype,
         args.learning_rate,
         args.weight_decay,
-        args.classification_weight,
+        resolved_classification_weight,
     )
 
     # model
-    model = Model(num_subjects, num_nodes, num_classes=num_classes, **model_args, device=device)
+    if resolved_data_mode == 'smri':
+        model = SmriModel(input_shape=input_shape, embedding_dim=args.embedding_dim, num_classes=num_classes, device=device)
+    else:
+        model = Model(num_subjects, num_nodes, num_classes=num_classes, **model_args, device=device)
 
     if args.command != 'inference':
         # Train
@@ -152,6 +177,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DBGDGM model.')
     parser.add_argument('--dataset', required=True, type=str, choices=['ukb', 'hcp', 'oasis'])
+    parser.add_argument('--data-mode', default='auto', choices=['auto', 'graph', 'smri'])
     parser.add_argument('--categorical-dim', required=True, type=int)
     parser.add_argument('--valid-prop', default=0.1, type=float)
     parser.add_argument('--test-prop', default=0.1, type=float)
@@ -161,12 +187,14 @@ if __name__ == '__main__':
     parser.add_argument('--window-size', default=15, type=int)
     parser.add_argument('--window-stride', default=5, type=int)
     parser.add_argument('--grid-size', default=15, type=int)
+    parser.add_argument('--image-size', default=128, type=int)
+    parser.add_argument('--num-slices', default=64, type=int)
     parser.add_argument('--embedding-dim', default=64, type=int)
     parser.add_argument('--batch-size', default=None, type=int)
     parser.add_argument('--learning-rate', default=1e-4, type=float)
     parser.add_argument('--weight-decay', default=1e-4, type=float)
-    parser.add_argument('--classification-weight', default=0.0, type=float,
-                        help='Auxiliary diagnosis loss weight. Leave at 0.0 to match the original DBGDGM objective.')
+    parser.add_argument('--classification-weight', default=None, type=float,
+                        help='Classification loss weight. Defaults to 1.0 for sMRI mode and 0.0 for graph mode.')
     parser.add_argument('--num-epochs', default=301, type=int)
     parser.add_argument('--anneal-rate', default=3e-4, type=float)
     parser.add_argument('--temp-min', default=0.05, type=float)

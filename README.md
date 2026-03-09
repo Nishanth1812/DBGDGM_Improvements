@@ -160,3 +160,15 @@ Detach without stopping training with `Ctrl+B`, then `D`.
 ### 10. Where results are saved
 
 Outputs are written to the attached volume under `/mnt/results`, including checkpoints, logs, and the OASIS cache.
+
+### 11. Download results to a named local run folder
+
+On Windows PowerShell, use the sync helper to pull the full `/mnt/trainingresults` volume directly into a target folder under `local_results`:
+
+```powershell
+.\Alzhiemers_Training\sync_results.ps1 `
+  159.223.209.77 `
+  -Destination ".\local_results\run 2"
+```
+
+That extracts the remote results directly into `local_results/run 2` rather than creating an extra nested `trainingresults` folder.

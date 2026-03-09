@@ -32,7 +32,7 @@ def inference(model,
     model_path = load_path if load_path.is_file() else load_path / "checkpoint_best_valid.pt"
 
     try:
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state'])
     except FileNotFoundError:
         print(f'No model found at path: {model_path}')
@@ -41,29 +41,39 @@ def inference(model,
     model.to(device)
     model.eval()
 
-    if dataset and isinstance(dataset[0][1][0], dict):
+    if dataset and isinstance(dataset[0][1], list) and dataset[0][1] and isinstance(dataset[0][1][0], dict):
         prepare_dataset_tensors(dataset, pin_memory=device.type == 'cuda')
 
     embeddings = model.predict_embeddings(dataset, valid_prop=valid_prop, test_prop=test_prop)
+    label_metrics = model.predict_label_metrics(dataset, valid_prop=valid_prop, test_prop=test_prop)
 
-    edge_nll, edge_aucroc, edge_ap = model.predict_auc_roc_precision(
-        dataset,
-        valid_prop=valid_prop,
-        test_prop=test_prop
-    )
+    if getattr(model, 'supports_edge_metrics', True):
+        edge_nll, edge_aucroc, edge_ap = model.predict_auc_roc_precision(
+            dataset,
+            valid_prop=valid_prop,
+            test_prop=test_prop
+        )
+        report = (
+            f"edge train nll {edge_nll['train']} aucroc {edge_aucroc['train']} ap {edge_ap['train']} | "
+            f"edge valid nll {edge_nll['valid']} aucroc {edge_aucroc['valid']} ap {edge_ap['valid']} | "
+            f"edge test nll {edge_nll['test']} aucroc {edge_aucroc['test']} ap {edge_ap['test']}"
+        )
+        print(report)
+    else:
+        edge_nll = {'train': float('nan'), 'valid': float('nan'), 'test': float('nan')}
+        edge_aucroc = {'train': float('nan'), 'valid': float('nan'), 'test': float('nan')}
+        edge_ap = {'train': float('nan'), 'valid': float('nan'), 'test': float('nan')}
+        print(
+            f"label loss {label_metrics['loss']:.4f} | acc {label_metrics['accuracy']:.4f} | "
+            f"bal_acc {label_metrics['balanced_accuracy']:.4f} | macro_f1 {label_metrics['macro_f1']:.4f} | "
+            f"macro_auc_ovr {label_metrics['macro_auc_ovr']:.4f}"
+        )
 
     try:
         diagnosis_metrics = evaluate_diagnosis_from_embeddings(embeddings, dataset)
     except Exception as exc:
         diagnosis_metrics = {'error': str(exc)}
 
-    report = (
-        f"edge train nll {edge_nll['train']} aucroc {edge_aucroc['train']} ap {edge_ap['train']} | "
-        f"edge valid nll {edge_nll['valid']} aucroc {edge_aucroc['valid']} ap {edge_ap['valid']} | "
-        f"edge test nll {edge_nll['test']} aucroc {edge_aucroc['test']} ap {edge_ap['test']}"
-    )
-
-    print(report)
     if 'error' in diagnosis_metrics:
         print(f"diagnosis evaluation unavailable: {diagnosis_metrics['error']}")
     else:
@@ -87,6 +97,7 @@ def inference(model,
                 'edge_nll': edge_nll,
                 'edge_aucroc': edge_aucroc,
                 'edge_ap': edge_ap,
+                'label_metrics': label_metrics,
                 'diagnosis_metrics': diagnosis_metrics,
                 'embeddings': embeddings
             })

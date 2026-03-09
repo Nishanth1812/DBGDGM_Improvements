@@ -10,6 +10,15 @@ import nilearn.connectome as conn
 import numpy as np
 
 
+def _normalize_smri_volume(volume, dtype=np.float32):
+    volume = np.asarray(volume, dtype=dtype)
+    mean = float(volume.mean())
+    std = float(volume.std())
+    if std <= 0:
+        std = 1.0
+    return (volume - mean) / std
+
+
 def _scan_oasis_subjects(data_dir="./data"):
     """
     Scans the directory for OASIS jpg slices, grouping all scans per subject.
@@ -104,6 +113,34 @@ def _normalize_dataset(dataset):
     return normalized, changed
 
 
+def _normalize_smri_dataset(dataset, dtype=np.float32):
+    normalized = []
+    changed = False
+
+    for new_subject_idx, sample in enumerate(dataset):
+        subject_idx, subject_data, label = sample
+        volume = np.asarray(subject_data['volume'], dtype=dtype)
+        if volume.ndim == 3:
+            volume = volume[None, ...]
+            changed = True
+
+        normalized.append([
+            new_subject_idx,
+            {
+                'volume': volume,
+                'num_slices': int(volume.shape[1]),
+                'height': int(volume.shape[2]),
+                'width': int(volume.shape[3]),
+            },
+            label,
+        ])
+
+        if subject_idx != new_subject_idx:
+            changed = True
+
+    return normalized, changed
+
+
 def _extract_timeseries_from_slices(slice_paths, grid_size=15, zscore=False, dtype=np.float32):
     """
     Treats the series of slices as "time" and regional patches as "nodes".
@@ -128,6 +165,52 @@ def _extract_timeseries_from_slices(slice_paths, grid_size=15, zscore=False, dty
                 
     if zscore: X = _zscore_timeseries(X)
     return X
+
+
+def _extract_smri_volume_from_slices(slice_paths, image_size=128, num_slices=64, dtype=np.float32):
+    if not slice_paths:
+        raise ValueError('slice_paths cannot be empty.')
+
+    target_h = image_size if isinstance(image_size, int) else int(image_size[0])
+    target_w = image_size if isinstance(image_size, int) else int(image_size[1])
+
+    sample_positions = np.linspace(0, len(slice_paths) - 1, num=num_slices)
+    slices = []
+
+    for position in sample_positions:
+        path = slice_paths[int(round(position))]
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Unable to read slice image: {path}")
+
+        resized = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        slices.append(resized.astype(dtype, copy=False) / 255.0)
+
+    volume = np.stack(slices, axis=0)
+    return _normalize_smri_volume(volume, dtype=dtype)
+
+
+def _build_subject_smri_volume(subject_entry, image_size=128, num_slices=64, dtype=np.float32):
+    scan_volumes = []
+
+    for scan in subject_entry['scans']:
+        if not scan['slices']:
+            continue
+        scan_volumes.append(
+            _extract_smri_volume_from_slices(
+                scan['slices'],
+                image_size=image_size,
+                num_slices=num_slices,
+                dtype=dtype,
+            )
+        )
+
+    if not scan_volumes:
+        raise ValueError(f"Subject {subject_entry['subject']} has no usable scans.")
+
+    subject_volume = np.mean(np.stack(scan_volumes, axis=0), axis=0)
+    subject_volume = _normalize_smri_volume(subject_volume, dtype=dtype)
+    return subject_volume[None, ...]
 
 
 def _compute_dynamic_fc(X,
@@ -174,8 +257,109 @@ def _compute_dynamic_fc(X,
     return G
 
 
+def _load_smri_dataset(dataset, data_dir, image_size=128, num_slices=64, dtype=np.float32):
+    filename = f"{dataset}_smri_slices-{num_slices}_img-{image_size}.pkl"
+    filepath = pathlib.Path(data_dir) / dataset / filename
+
+    if filepath.exists():
+        print(f"[dataset] Found cached sMRI dataset at {filepath}. Loading from disk...", flush=True)
+        logging.info('Found an existing sMRI .pkl dataset. Loading...')
+        with open(filepath, 'rb') as input_file:
+            smri_dataset = pickle.load(input_file)
+        smri_dataset, cache_changed = _normalize_smri_dataset(smri_dataset, dtype=dtype)
+        if cache_changed:
+            logging.info('Normalizing cached sMRI dataset format for stable subject indexing.')
+            with open(filepath, 'wb') as output_file:
+                pickle.dump(smri_dataset, output_file)
+        print(f"[dataset] Loaded {len(smri_dataset)} sMRI subjects from cache.", flush=True)
+        logging.info('Loaded dataset.')
+        return smri_dataset
+
+    print(f"[dataset] No cached sMRI dataset found. Starting volume preprocessing...", flush=True)
+    sequences = _scan_oasis_subjects(data_dir=pathlib.Path(data_dir))
+    logging.info(f'Found {len(sequences)} subjects in {data_dir}')
+
+    if len(sequences) == 0:
+        logging.warning('No JPG files found properly structured under classes!')
+        print('[dataset] ERROR: No JPG files found! Check data directory structure.', flush=True)
+        return []
+
+    total = len(sequences)
+    dataset_out = []
+    skipped = 0
+    t_start = time.time()
+
+    for idx, seq in enumerate(sequences):
+        t_seq = time.time()
+        pct = (idx + 1) / total * 100
+        bar = '#' * (idx * 20 // total) + '-' * (20 - idx * 20 // total)
+        total_slices = sum(len(scan['slices']) for scan in seq['scans'])
+        print(
+            f"[dataset] [{bar}] {idx+1}/{total} ({pct:.1f}%) | {seq['subject']} "
+            f"scans={len(seq['scans'])} slices={total_slices} (label={seq['label']})",
+            flush=True,
+        )
+
+        try:
+            volume = _build_subject_smri_volume(
+                seq,
+                image_size=image_size,
+                num_slices=num_slices,
+                dtype=dtype,
+            )
+        except Exception as exc:
+            skipped += 1
+            logging.warning(f"Skipping subject {seq['subject']} during sMRI preprocessing: {exc}")
+            print(f"[dataset]   -> SKIPPED subject due to preprocessing error: {exc}", flush=True)
+            continue
+
+        dataset_out.append([
+            len(dataset_out),
+            {
+                'volume': volume,
+                'num_slices': int(volume.shape[1]),
+                'height': int(volume.shape[2]),
+                'width': int(volume.shape[3]),
+            },
+            seq['label'],
+        ])
+
+        elapsed = time.time() - t_seq
+        total_elapsed = time.time() - t_start
+        avg_per_seq = total_elapsed / (idx + 1)
+        eta = avg_per_seq * (total - idx - 1)
+        print(
+            f"[dataset]   -> Done in {elapsed:.1f}s | volume_shape={volume.shape} | "
+            f"total elapsed: {total_elapsed/60:.1f}m | ETA: {eta/60:.1f}m",
+            flush=True,
+        )
+
+    print(f"[dataset] sMRI preprocessing complete! {len(dataset_out)} samples kept, {skipped} skipped.", flush=True)
+    print(f"[dataset] Saving sMRI dataset to {filepath}...", flush=True)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, 'wb') as output_file:
+        pickle.dump(dataset_out, output_file)
+    print('[dataset] Dataset saved successfully.', flush=True)
+
+    logging.info('Loaded dataset.')
+    return dataset_out
+
+
 def load_dataset(dataset="oasis", window_size=15, window_stride=5, measure="correlation",
-                 top_percent=10, grid_size=15, data_dir="../data", **kwargs):
+                 top_percent=10, grid_size=15, data_dir="../data", data_mode='auto',
+                 image_size=128, num_slices=64, **kwargs):
+    resolved_mode = data_mode
+    if resolved_mode == 'auto':
+        resolved_mode = 'smri' if dataset == 'oasis' else 'graph'
+
+    if resolved_mode == 'smri':
+        return _load_smri_dataset(
+            dataset=dataset,
+            data_dir=data_dir,
+            image_size=image_size,
+            num_slices=num_slices,
+        )
+
     # load dataset if already exists
     filename = "{}_subjects_w-{}_s-{}_m-{}_p-{}_g-{}.pkl".format(dataset, window_size, window_stride, measure, top_percent, grid_size)
     _filepath = pathlib.Path(data_dir) / dataset / filename

@@ -13,6 +13,10 @@ from .diagnosis import evaluate_diagnosis_from_embeddings
 from .utils import prepare_dataset_tensors
 
 
+def _nan_metric_dict():
+    return {'train': float('nan'), 'valid': float('nan'), 'test': float('nan')}
+
+
 def _save_checkpoint(path, filename, model, optimizer, scaler,
                      epoch, temp, learning_rate,
                      best_nll, best_nll_train, best_label_score,
@@ -122,7 +126,12 @@ def train(model, dataset,
     # Move model to device
     model.to(device)
 
-    if dataset and isinstance(dataset[0][1][0], dict):
+    metric_mode = getattr(model, 'metric_mode', 'graph')
+    effective_classification_weight = classification_weight
+    if metric_mode == 'classification' and (effective_classification_weight is None or effective_classification_weight <= 0):
+        effective_classification_weight = 1.0
+
+    if dataset and isinstance(dataset[0][1], list) and dataset[0][1] and isinstance(dataset[0][1][0], dict):
         prepare_dataset_tensors(dataset, pin_memory=device.type == 'cuda')
         logging.info('Prepared cached edge tensors for the dataset to reduce CPU overhead during training.')
 
@@ -143,24 +152,25 @@ def train(model, dataset,
             logging.warning(f"resume_from path not found: {resume_from}. Starting from scratch.")
         else:
             logging.info(f"Resuming training from checkpoint: {resume_from}")
-            ckpt = torch.load(resume_from, map_location=device)
+            ckpt = torch.load(resume_from, map_location=device, weights_only=False)
             ckpt_state = ckpt['model_state']
 
-            ckpt_n    = ckpt_state['alpha_mean.weight'].shape[0]
-            current_n = model.alpha_mean.weight.shape[0]
+            if metric_mode == 'graph':
+                ckpt_n = ckpt_state['alpha_mean.weight'].shape[0]
+                current_n = model.alpha_mean.weight.shape[0]
 
-            if ckpt_n != current_n:
-                raise ValueError(
-                    f"Subject count mismatch: checkpoint={ckpt_n}, current={current_n}. "
-                    "Refusing partial resume to avoid embedding misalignment and overfitting. "
-                    "Start a fresh run (no --resume-from), or regenerate dataset with identical subject set/order."
-                )
-            else:
-                model.load_state_dict(ckpt_state)
-                try:
-                    optimizer.load_state_dict(ckpt['optimizer_state'])
-                except (ValueError, KeyError, RuntimeError):
-                    logging.warning("Optimizer state incompatible — starting with fresh optimizer.")
+                if ckpt_n != current_n:
+                    raise ValueError(
+                        f"Subject count mismatch: checkpoint={ckpt_n}, current={current_n}. "
+                        "Refusing partial resume to avoid embedding misalignment and overfitting. "
+                        "Start a fresh run (no --resume-from), or regenerate dataset with identical subject set/order."
+                    )
+
+            model.load_state_dict(ckpt_state)
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state'])
+            except (ValueError, KeyError, RuntimeError):
+                logging.warning("Optimizer state incompatible — starting with fresh optimizer.")
 
 
             if 'scaler_state' in ckpt:
@@ -180,7 +190,9 @@ def train(model, dataset,
             )
 
 
-    use_label_supervision = classification_weight is not None and classification_weight > 0
+    use_label_supervision = metric_mode == 'classification' or (
+        effective_classification_weight is not None and effective_classification_weight > 0
+    )
     train_dataset = dataset
     eval_dataset = dataset
     class_weights = None
@@ -215,7 +227,7 @@ def train(model, dataset,
         class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
 
         logging.info(f"Subject split: {len(train_dataset)} train / {len(eval_dataset)} eval (held-out)")
-        logging.info(f"Classification loss weight: {classification_weight:.3f}")
+        logging.info(f"Classification loss weight: {effective_classification_weight:.3f}")
     else:
         logging.info('Using the original DBGDGM objective by default (edge reconstruction only).')
         logging.info('Diagnosis performance should be read from downstream embedding evaluation, not the training loss.')
@@ -250,7 +262,7 @@ def train(model, dataset,
                         + 0.1  * batch_loss['kld_beta']
                         + 0.01 * batch_loss['kld_phi']) / len(batch_graphs)
                 if use_label_supervision:
-                    loss = loss + classification_weight * (batch_loss['classification'] / len(batch_graphs))
+                    loss = loss + effective_classification_weight * (batch_loss['classification'] / len(batch_graphs))
 
             scaler.scale(loss).backward()
             if max_grad_norm is not None and max_grad_norm > 0:
@@ -271,10 +283,13 @@ def train(model, dataset,
         if epoch % eval_every == 0:
             model.eval()
             with torch.no_grad():
-                edge_nll, edge_aucroc, edge_ap = model.predict_auc_roc_precision(
-                    eval_dataset,
-                    valid_prop=valid_prop,
-                    test_prop=test_prop)
+                if getattr(model, 'supports_edge_metrics', True):
+                    edge_nll, edge_aucroc, edge_ap = model.predict_auc_roc_precision(
+                        eval_dataset,
+                        valid_prop=valid_prop,
+                        test_prop=test_prop)
+                else:
+                    edge_nll, edge_aucroc, edge_ap = _nan_metric_dict(), _nan_metric_dict(), _nan_metric_dict()
                 diagnosis_metrics = None
                 if use_label_supervision:
                     label_metrics = model.predict_label_metrics(
@@ -305,14 +320,22 @@ def train(model, dataset,
                         diagnosis_metrics = {'error': str(exc)}
 
             if use_label_supervision:
-                logging.info(
-                    f"Epoch {epoch} [eval | {len(eval_dataset)} held-out subjects] | "
-                    f"edge train nll {edge_nll['train']:.4f} aucroc {edge_aucroc['train']:.4f} ap {edge_ap['train']:.4f} | "
-                    f"edge valid nll {edge_nll['valid']:.4f} aucroc {edge_aucroc['valid']:.4f} ap {edge_ap['valid']:.4f} | "
-                    f"edge test nll {edge_nll['test']:.4f} aucroc {edge_aucroc['test']:.4f} ap {edge_ap['test']:.4f} | "
-                    f"label loss {label_metrics['loss']:.4f} acc {label_metrics['accuracy']:.4f} "
-                    f"bal_acc {label_metrics['balanced_accuracy']:.4f} macro_f1 {label_metrics['macro_f1']:.4f}"
-                )
+                if getattr(model, 'supports_edge_metrics', True):
+                    logging.info(
+                        f"Epoch {epoch} [eval | {len(eval_dataset)} held-out subjects] | "
+                        f"edge train nll {edge_nll['train']:.4f} aucroc {edge_aucroc['train']:.4f} ap {edge_ap['train']:.4f} | "
+                        f"edge valid nll {edge_nll['valid']:.4f} aucroc {edge_aucroc['valid']:.4f} ap {edge_ap['valid']:.4f} | "
+                        f"edge test nll {edge_nll['test']:.4f} aucroc {edge_aucroc['test']:.4f} ap {edge_ap['test']:.4f} | "
+                        f"label loss {label_metrics['loss']:.4f} acc {label_metrics['accuracy']:.4f} "
+                        f"bal_acc {label_metrics['balanced_accuracy']:.4f} macro_f1 {label_metrics['macro_f1']:.4f}"
+                    )
+                else:
+                    logging.info(
+                        f"Epoch {epoch} [eval | {len(eval_dataset)} held-out subjects] | "
+                        f"label loss {label_metrics['loss']:.4f} acc {label_metrics['accuracy']:.4f} "
+                        f"bal_acc {label_metrics['balanced_accuracy']:.4f} macro_f1 {label_metrics['macro_f1']:.4f} "
+                        f"macro_auc_ovr {label_metrics['macro_auc_ovr']:.4f}"
+                    )
             else:
                 logging.info(
                     f"Epoch {epoch} [eval | all subjects] | "
@@ -332,7 +355,7 @@ def train(model, dataset,
                         )
 
             save_valid = label_metrics['balanced_accuracy'] > best_label_score if use_label_supervision else edge_nll['valid'] < best_nll
-            save_train = edge_nll['train'] < best_nll_train
+            save_train = False if metric_mode == 'classification' else edge_nll['train'] < best_nll_train
 
             # Compute embeddings once if any checkpoint needs saving
             if save_valid or save_train:

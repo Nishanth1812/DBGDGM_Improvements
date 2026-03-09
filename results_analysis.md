@@ -1,38 +1,20 @@
-# OASIS Dataset Training Results Analysis
+# OASIS Training Results
 
-## Overview
+These runs are mostly measuring edge reconstruction, not Alzheimer's diagnosis. The training objective does not use the OASIS labels directly, so edge AUCROC and AP should be read as graph prediction metrics. Diagnosis numbers below come from a separate downstream evaluation on the learned embeddings.
 
-This document provides an analysis of the recent model training run on the OASIS dataset, based on the logs generated on **March 3, 2026** (`train_oasis_trial1_20260303_030313.log`).
+## Run 1
 
-> Important: the March 3 run reported below was evaluating **edge reconstruction / link prediction quality inside dynamic brain graphs**, not dementia diagnosis classification. The original training pipeline did not use the OASIS class labels in the loss, so the AUCROC and AP values below should not be interpreted as Alzheimer's classification accuracy.
+This run comes from the March 3 log `train_oasis_trial1_20260303_030313.log`. It used 1410 subjects, resumed from epoch 180, found its best validation checkpoint at epoch 200, and then kept training until early stopping at epoch 500. The pattern is straightforward: the model kept fitting the training data, while validation quality drifted the wrong way.
 
-## Dataset and Configuration
+Best validation checkpoint at epoch 200:
 
-- **Dataset:** OASIS (Parameters: `w-15`, `s-5`, `m-correlation`, `p-10`, `g-15`)
-- **Total Subjects:** 1410 (each with 225 nodes)
-- **Data Split:** 1128 Train / 282 Eval (Held-out)
-- **Early Stopping:** Triggered if no improvement in validation Negative Log-Likelihood (NLL) for 15 evaluation steps (300 epochs).
+| Metric                     | Train  | Validation | Test   |
+| :------------------------- | :----- | :--------- | :----- |
+| **NLL**                    | 5.1650 | 5.1404     | 5.1360 |
+| **Edge AUCROC**            | 0.6077 | 0.6114     | 0.6170 |
+| **Average Precision (AP)** | 0.5697 | 0.5732     | 0.5729 |
 
-## Training Progression
-
-- The training resumed from an existing checkpoint at **Epoch 180** (Previous Best Valid NLL: 5.1889).
-- At **Epoch 200**, the model hit its peak performance for validation data and corresponding test data.
-- The training continued until **Epoch 500**, where **Early Stopping** was triggered, as validation NLL failed to improve for 15 consecutive evaluation checks (300 epochs).
-- Between Epoch 200 and Epoch 500, the model exhibited steady minimization of training losses (KL divergences and NLL), but the validation and test NLLs gradually increased, clearly indicating **overfitting** to the training dataset.
-
-## Key Edge-Reconstruction Metrics at Best Validation (Epoch 200)
-
-The best validation checkpoint was saved at this epoch due to achieving the lowest Validation NLL.
-
-| Metric                     | Train  | Validation | Test       |
-| :------------------------- | :----- | :--------- | :--------- |
-| **NLL**                    | 5.1650 | **5.1404** | **5.1360** |
-| **Edge AUCROC**            | 0.6077 | 0.6114     | 0.6170     |
-| **Average Precision (AP)** | 0.5697 | 0.5732     | 0.5729     |
-
-## Final Edge-Reconstruction Metrics before Early Stopping (Epoch 500)
-
-By the end of the training, the model degraded in generalizability.
+Final checkpoint before early stopping at epoch 500:
 
 | Metric                     | Train  | Validation | Test   |
 | :------------------------- | :----- | :--------- | :----- |
@@ -40,16 +22,39 @@ By the end of the training, the model degraded in generalizability.
 | **Edge AUCROC**            | 0.5868 | 0.5846     | 0.5895 |
 | **Average Precision (AP)** | 0.5439 | 0.5392     | 0.5398 |
 
-## Output Files Checkpoints
+Takeaway: Run 1 clearly overfit after epoch 200. If this run is used at all, `checkpoint_best_valid.pt` is the only checkpoint worth keeping for evaluation.
 
-The following checkpoints have been saved and are ready for inference or future retraining:
+## Run 2
 
-- `/mnt/trainingresults/models_oasis_1/checkpoint_best_valid.pt` (Best generalization, from Epoch 200)
-- `/mnt/trainingresults/models_oasis_1/checkpoint_best_train.pt`
-- `/mnt/trainingresults/models_oasis_1/checkpoint_latest.pt` (From Epoch 500)
+This run comes from the March 8 log `train_oasis_trial1_20260308_061215.log`. It used the subject-level cache with 365 subjects, batch size 32, learning rate `1e-4`, weight decay `1e-4`, and `classification_weight=0.0`. It started from scratch, reached its best validation checkpoint at epoch 85, and stopped early at epoch 110.
 
-## Conclusion and Recommendations
+Best validation checkpoint at epoch 85:
 
-1. **Metric Scope**: The model achieved an edge-reconstruction AUCROC of ~0.617 on held-out graph edges, not a dementia classification AUCROC. A separate label-aware objective or downstream classifier is required for Alzheimer's diagnosis performance claims.
-2. **Overfitting**: The model aggressively overfits after Epoch 200. The divergence between train NLL and valid NLL becomes large. Consider increasing regularization techniques (e.g., dropout, weight decay) or tuning the capacity of the model to prevent such rapid overfitting in later epochs.
-3. **Use the Right Checkpoint**: For any downstream evaluation, strictly use `checkpoint_best_valid.pt` rather than `checkpoint_latest.pt`.
+| Metric                     | Train  | Validation | Test   |
+| :------------------------- | :----- | :--------- | :----- |
+| **NLL**                    | 5.3004 | 5.3017     | 5.2979 |
+| **Edge AUCROC**            | 0.6060 | 0.6083     | 0.6097 |
+| **Average Precision (AP)** | 0.5700 | 0.5703     | 0.5736 |
+
+Final checkpoint before early stopping at epoch 110:
+
+| Metric                     | Train  | Validation | Test   |
+| :------------------------- | :----- | :--------- | :----- |
+| **NLL**                    | 5.2999 | 5.3018     | 5.2973 |
+| **Edge AUCROC**            | 0.6063 | 0.6082     | 0.6104 |
+| **Average Precision (AP)** | 0.5702 | 0.5700     | 0.5746 |
+
+Downstream diagnosis metrics from the saved embeddings:
+
+| Metric                | Best Validation | Final |
+| :-------------------- | :-------------- | :---- |
+| **Accuracy**          | 0.4904 +/- 0.0271 | 0.4915 +/- 0.0456 |
+| **Balanced Accuracy** | 0.2682 +/- 0.0445 | 0.2822 +/- 0.0343 |
+| **Macro F1**          | 0.2437 +/- 0.0240 | 0.2503 +/- 0.0263 |
+| **Macro AUC OVR**     | 0.5655 +/- 0.0462 | 0.5792 +/- 0.0297 |
+
+Takeaway: Run 2 is much more stable than Run 1, but the diagnosis signal is still weak. Balanced accuracy stays below 0.30, and the rarest class has only 2 subjects, so these diagnosis metrics should be treated cautiously. For comparisons or downstream use, `checkpoint_best_valid.pt` is still the right checkpoint.
+
+## Bottom Line
+
+Run 2 is the cleaner result. It avoids the obvious late overfitting seen in Run 1 and keeps edge-reconstruction quality roughly flat through training. That said, neither run supports a strong diagnosis claim yet. If the goal is Alzheimer's classification, the next improvement needs to come from the modeling setup or evaluation design, not from squeezing a few more epochs out of the current objective.
