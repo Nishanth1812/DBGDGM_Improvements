@@ -220,32 +220,38 @@ def apply_temporal_filter(timeseries: np.ndarray,
 def extract_timeseries_windows(timeseries: np.ndarray,
                               window_size: int,
                               window_step: int = 1,
-                              standardize: bool = True) -> np.ndarray:
+                              standardize: bool = True,
+                              dbgdgm_format: bool = True) -> np.ndarray:
     """
-    Extract sliding windows from timeseries.
+    Extract sliding windows from timeseries - DBGDGM-compatible output.
     
-    Converts [N_ROI, T] to [N_ROI, N_windows, window_size]
-    then reshapes to [N_ROI*N_windows, window_size] for model input.
+    Converts [N_ROI, T] to [N_samples, N_ROI, window_size]
+    where N_samples = number of sliding windows.
     
     Parameters
     ----------
     timeseries : np.ndarray
         Input timeseries [N_ROI, T]
     window_size : int
-        Size of each window in TRs
+        Size of each window in TRs (typically 50 for DBGDGM)
     window_step : int
-        Step size between windows
+        Step size between windows (typically 1 for maximal overlap)
     standardize : bool
-        Standardize each window independently
+        Standardize each window independently (z-score normalization)
+    dbgdgm_format : bool
+        If True (default), return [N_samples, N_ROI, window_size]
+        If False, return flattened [N_samples*N_ROI, window_size] (legacy)
         
     Returns
     -------
     windows : np.ndarray
-        Window timeseries [N_ROI*N_windows, window_size]
+        If dbgdgm_format=True: [N_samples, N_ROI, window_size]
+                              Ready for DBGDGM fMRI encoder
+        If dbgdgm_format=False: [N_samples*N_ROI, window_size] (legacy)
     """
     n_roi, n_timepoints = timeseries.shape
     
-    # Extract windows
+    # Extract windows: [N_ROI, N_windows, window_size]
     n_windows = (n_timepoints - window_size) // window_step + 1
     
     windows = np.zeros((n_roi, n_windows, window_size), dtype=np.float32)
@@ -263,8 +269,13 @@ def extract_timeseries_windows(timeseries: np.ndarray,
                 std = np.std(windows[r, w, :])
                 windows[r, w, :] = (windows[r, w, :] - mean) / (std + 1e-8)
     
-    # Reshape to [N_ROI*N_windows, window_size]
-    windows = windows.transpose(0, 1, 2).reshape(n_roi * n_windows, window_size)
+    # Format output for DBGDGM
+    if dbgdgm_format:
+        # Transpose to [N_windows, N_ROI, window_size]
+        windows = windows.transpose(1, 0, 2).astype(np.float32)
+    else:
+        # Legacy format: reshape to [N_ROI*N_windows, window_size]
+        windows = windows.transpose(0, 1, 2).reshape(n_roi * n_windows, window_size)
     
     return windows.astype(np.float32)
 

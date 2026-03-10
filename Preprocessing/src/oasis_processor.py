@@ -21,8 +21,8 @@ import pandas as pd
 import warnings
 from dataclasses import dataclass
 
-from ..utils.dicom_utils import Image2DLoader
-from .smri_preprocessing import sMRIPreprocessor, sMRIConfig
+from .utils.dicom_utils import Image2DLoader
+from .smri.smri_preprocessing import sMRIPreprocessor, sMRIConfig
 
 
 @dataclass

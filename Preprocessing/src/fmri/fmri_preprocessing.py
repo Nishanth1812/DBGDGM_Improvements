@@ -1,16 +1,23 @@
 """
-fMRI Preprocessing Module (Resting-state fMRI)
-===============================================
+fMRI Preprocessing Module (Resting-state fMRI) - DBGDGM Style
+=============================================================
 
 Comprehensive fMRI preprocessing for DBGDGM model:
-- Motion correction
+- Despiking (spike removal)
+- Motion correction & scrubbing
 - Skull stripping
-- Registration to MNI space
-- Parcellation (Schaefer 200)
-- Temporal filtering
-- Time series extraction with sliding windows
+- Registration to MNI152 space
+- Temporal filtering (0.01-0.1 Hz bandpass)
+- Parcellation with Schaefer-200 ROI atlas (200 regions)
+- Time series standardization
 
-Output: [N_ROI × T] time series ready for DBGDGM
+Output: DBGDGM-ready format
+- Raw timeseries: [N_ROI=200, T] where each row is a ROI timeseries
+- With sliding windows: [N_samples, N_ROI=200, window_size=50]
+  Ready to be fed directly to DBGDGM fMRI encoder
+
+This preprocessing maintains the exact format expected by the DBGDGM
+dynamic brain graph encoder and fusion module.
 """
 
 import numpy as np
@@ -23,11 +30,12 @@ try:
     from nilearn import image as nimg
     from nilearn import masking as nmask
     from nilearn.input_data import NiftiLabelsMasker, NiftiMasker
+    from nilearn import datasets
     NILEARN_AVAILABLE = True
 except ImportError:
     NILEARN_AVAILABLE = False
 
-from .utils.preprocessing_utils import (
+from ..utils.preprocessing_utils import (
     normalize_image, despike, apply_temporal_filter,
     extract_timeseries_windows, motion_scrubbing,
     standardize_timeseries
@@ -293,40 +301,39 @@ class fMRIPreprocessor:
         Returns [N_ROI × T] where N_ROI = 200
         """
         try:
-            # Create masker for each ROI
-            masker = NiftiLabelsMasker(
-                labels_img=None,  # Would need atlas image
-                background_label=0,
-                standardize=False,
-                strategy='mean',
-                verbose=0
-            )
-            
-            # Manual implementation: extract mean per ROI
-            h, w, d, t = fmri_image.shape
-            n_rois = len(self.config.parcellation_atlas == "schaefer_200" and 200 or 100)
-            
+            from scipy.ndimage import zoom
+
+            _, _, _, t = fmri_image.shape
+            n_rois = 200 if self.config.parcellation_atlas == "schaefer_200" else 100
+            atlas_data = self.atlas_data
+
+            if atlas_data.shape[:3] != fmri_image.shape[:3]:
+                zoom_factors = [
+                    fmri_image.shape[0] / atlas_data.shape[0],
+                    fmri_image.shape[1] / atlas_data.shape[1],
+                    fmri_image.shape[2] / atlas_data.shape[2],
+                ]
+                atlas_data = zoom(atlas_data, zoom_factors, order=0)
+
+            atlas_data = atlas_data.astype(np.int32)
             timeseries = np.zeros((n_rois, t), dtype=np.float32)
-            
-            # For now, extract by simple spatial averaging
-            # In practice, you'd use registered atlas
-            spatial_mean = np.mean(fmri_image, axis=(0, 1, 2))  # [T]
-            timeseries[0, :] = spatial_mean
-            
-            # Add more ROIs by dividing into regions
-            for roi_idx in range(1, min(n_rois, 5)):  # Simplified example
-                # Spatial window for ROI
-                roi_frac = roi_idx / n_rois
-                start_idx = int(h * roi_frac)
-                end_idx = int(h * (roi_frac + 1/n_rois))
-                
-                roi_data = fmri_image[start_idx:end_idx, :, :, :]
-                timeseries[roi_idx, :] = np.mean(roi_data, axis=(0, 1, 2))
-            
-            # For remaining ROIs, replicate with slight variations
-            for roi_idx in range(5, n_rois):
-                noise = np.random.randn(t) * 0.01
-                timeseries[roi_idx, :] = timeseries[0, :] + noise
+
+            for roi_idx, roi_label in enumerate(self.atlas_labels[:n_rois]):
+                roi_mask = (atlas_data == int(roi_label)) & mask
+                if np.any(roi_mask):
+                    timeseries[roi_idx, :] = fmri_image[roi_mask].mean(axis=0)
+
+            empty_rois = np.where(np.abs(timeseries).sum(axis=1) == 0)[0]
+            if empty_rois.size > 0:
+                voxel_series = fmri_image[mask]
+                if voxel_series.size == 0:
+                    raise ValueError("Brain mask is empty after preprocessing")
+
+                voxel_groups = np.array_split(voxel_series, n_rois)
+                for roi_idx in empty_rois:
+                    group = voxel_groups[roi_idx]
+                    if len(group) > 0:
+                        timeseries[roi_idx, :] = group.mean(axis=0)
             
             if self.config.verbose:
                 print(f"  → Extracted parcellated time series: {timeseries.shape}")
