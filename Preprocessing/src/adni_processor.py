@@ -22,9 +22,9 @@ import warnings
 from dataclasses import dataclass
 import json
 
-from ..utils.dicom_utils import DICOMLoader
-from ..fmri.fmri_preprocessing import fMRIPreprocessor, fMRIConfig
-from ..smri.smri_preprocessing import sMRIPreprocessor, sMRIConfig
+from .utils.dicom_utils import DICOMLoader
+from .fmri.fmri_preprocessing import fMRIPreprocessor, fMRIConfig
+from .smri.smri_preprocessing import sMRIPreprocessor, sMRIConfig
 
 
 @dataclass

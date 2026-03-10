@@ -27,7 +27,7 @@ try:
 except ImportError:
     NILEARN_AVAILABLE = False
 
-from .utils.preprocessing_utils import normalize_image, resample_image
+from ..utils.preprocessing_utils import normalize_image, resample_image
 
 
 @dataclass
