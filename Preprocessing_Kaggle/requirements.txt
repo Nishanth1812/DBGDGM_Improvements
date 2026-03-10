@@ -1,0 +1,8 @@
+# Auto-installed on Kaggle, but listing for reference:
+nibabel>=5.0.0
+nilearn>=0.10.0
+pydicom>=2.4.0
+scikit-image
+scipy
+numpy
+pandas
