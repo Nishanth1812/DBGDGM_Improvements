@@ -136,6 +136,11 @@ class Trainer:
                     f"Loss: {total_loss.item():.4f}, "
                     f"Acc: {acc.item():.4f}"
                 )
+
+        if num_batches == 0:
+            raise ValueError(
+                "Training dataloader produced zero batches. Check dataset size, modality files, and drop_last settings."
+            )
         
         # Average metrics
         for key in metrics:
@@ -206,6 +211,11 @@ class Trainer:
             all_targets.extend(targets.cpu().numpy())
             
             num_batches += 1
+
+        if num_batches == 0:
+            raise ValueError(
+                "Validation dataloader produced zero batches. Check dataset size and modality files."
+            )
         
         # Average metrics
         for key in metrics:
@@ -254,7 +264,10 @@ class Trainer:
         # Training loop
         for epoch in range(num_epochs):
             # KL annealing
-            beta = min(1.0, epoch / annealing_epochs)
+            if annealing_epochs <= 0:
+                beta = 1.0
+            else:
+                beta = min(1.0, epoch / annealing_epochs)
             
             # Train
             train_metrics = self.train_epoch(train_loader, optimizer, epoch, beta_annealing=beta)
