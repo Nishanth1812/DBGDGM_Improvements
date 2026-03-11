@@ -241,6 +241,9 @@ class Predictor:
             Dict with aggregated predictions and metrics
         """
         from torch.utils.data import DataLoader
+
+        if len(dataset) == 0:
+            raise ValueError("Cannot run inference on an empty dataset")
         
         dataloader = DataLoader(
             dataset,
@@ -374,7 +377,8 @@ def main():
     dataset = MultimodalBrainDataset(
         dataset_root=args.dataset_root,
         metadata_file=args.metadata,
-        normalize=True
+        normalize_fmri=True,
+        normalize_smri=True
     )
     logger.info(f"Dataset contains {len(dataset)} samples")
     

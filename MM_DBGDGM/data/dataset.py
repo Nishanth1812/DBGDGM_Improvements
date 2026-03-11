@@ -191,6 +191,15 @@ class MultimodalBrainDataset(Dataset):
         # Load modalities
         fmri = self._load_fmri(subject_id, timepoint)
         smri = self._load_smri(subject_id, timepoint)
+
+        if 'fmri' in self.modalities and fmri is None:
+            raise FileNotFoundError(
+                f"Missing or invalid fMRI data for subject '{subject_id}' at timepoint '{timepoint}'"
+            )
+        if 'smri' in self.modalities and smri is None:
+            raise FileNotFoundError(
+                f"Missing or invalid sMRI data for subject '{subject_id}' at timepoint '{timepoint}'"
+            )
         
         if fmri is not None:
             data['fmri'] = fmri

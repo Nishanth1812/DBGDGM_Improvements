@@ -288,9 +288,10 @@ class CompleteVAE(nn.Module):
         
         # Sample z from posterior
         z = self.reparameterize(mu, logvar)
-        
-        # Classification (typically uses mu at inference)
-        logits = self.classifier(z)
+
+        # Use stochastic samples during training and deterministic means during evaluation.
+        classifier_input = z if self.training else mu
+        logits = self.classifier(classifier_input)
         
         # Reconstruction
         fmri_recon, smri_recon = self.decoder(z)

@@ -332,7 +332,8 @@ def main():
     dataset = MultimodalBrainDataset(
         dataset_root=args.dataset_root,
         metadata_file=args.metadata,
-        normalize=True
+        normalize_fmri=True,
+        normalize_smri=True
     )
     logger.info(f"Test dataset contains {len(dataset)} samples")
     

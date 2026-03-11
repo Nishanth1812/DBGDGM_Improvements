@@ -1,5 +1,9 @@
 # DBGDGM_Improvements
 
+## Kaggle Training
+
+For the end-to-end Kaggle path from raw preprocessing outputs to final `fmri.npy`, `smri.npy`, and `labels.npy`, use `KAGGLE_README.md`.
+
 ## DigitalOcean Training Quick Guide
 
 Use this when training on the DigitalOcean droplet at `159.223.209.77` and storing outputs on the attached volume named `results`.
