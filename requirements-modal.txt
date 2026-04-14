@@ -1,0 +1,31 @@
+# Modal-specific dependencies for MM-DBGDGM training
+# Install with: pip install -r requirements-modal.txt
+
+# Core Modal Framework
+modal>=0.66.0
+gdown>=5.2.0
+
+# ML/DL Stack (already in requirements.txt but included for clarity)
+torch>=2.2.0
+torchvision>=0.17.0
+numpy>=1.26
+scipy>=1.12
+scikit-learn>=1.4
+
+# Data Processing
+nilearn>=0.10.0
+nibabel>=5.0.0
+pydicom>=2.4.0
+networkx>=3.2
+pandas>=2.0
+
+# Configuration & Logging
+pyyaml>=6.0
+tqdm>=4.66
+
+# Visualization (useful for local testing)
+matplotlib>=3.8
+tensorboard>=2.15
+
+# Image Processing
+opencv-python-headless>=4.9

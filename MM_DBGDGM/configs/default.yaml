@@ -1,0 +1,66 @@
+# MM-DBGDGM Training Configuration
+
+# Data configuration
+data:
+  dataset_root: '/path/to/preprocessed_data'  # Root directory with fmri/ and smri/ subdirs
+  train_metadata: '/path/to/train_metadata.csv'  # CSV: subject_id, timepoint, label
+  val_metadata: '/path/to/val_metadata.csv'
+  test_metadata: '/path/to/test_metadata.csv'  # Optional
+  normalize: true  # Normalize inputs
+
+# Model configuration
+model:
+  # fMRI encoder
+  n_roi: 200  # Schaefer-200 atlas
+  seq_len: 50  # Temporal window size
+  
+  # sMRI features
+  n_smri_features: 5  # ADNI: 5 features, OASIS: 6 features
+  
+  # VAE/Latent dimensions
+  latent_dim: 256
+  num_classes: 4  # CN, eMCI, lMCI, AD
+  
+  # Encoders
+  use_gat_encoder: true  # Use Graph Attention for sMRI (vs simple MLP)
+  use_attention_fusion: true  # Use cross-modal attention (vs simple concat)
+  num_fusion_heads: 4  # Attention heads
+  num_fusion_iterations: 2  # Bidirectional attention iterations
+  
+  # Regularization
+  dropout: 0.1
+
+# Training configuration
+training:
+  # Data loading
+  batch_size: 32
+  num_workers: 4  # CPU workers for data loading
+  
+  # Optimization
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 1e-5  # L2 regularization
+  
+  # Loss weights
+  lambda_kl: 0.1  # KL divergence weight
+  lambda_align: 0.1  # Cross-modal alignment weight
+  lambda_recon: 0.1  # Reconstruction weight
+  
+  # Early stopping
+  patience: 10  # Stop if no improvement for N epochs
+  
+  # KL annealing
+  annealing_epochs: 20  # Linearly increase KL weight over N epochs
+  
+  # Reproducibility
+  seed: 42
+
+# Loss function weights
+loss:
+  fmri_recon_weight: 2.0  # Higher weight for fMRI reconstruction
+  smri_recon_weight: 1.0
+
+# Logging
+logging:
+  level: 'INFO'
+  save_interval: 5  # Save checkpoint every N epochs
