@@ -1,0 +1,57 @@
+# DBGDGM Improvements — .gitignore
+# ─────────────────────────────────────────────────────────────────
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Data and checkpoints — use rsync to transfer to droplet
+Alzhiemers_Training/data/
+Alzhiemers_Training/models/
+*.tar.gz
+*.tar
+
+# Training outputs (synced via rsync, not git)
+models_*/
+local_results/
+logs/
+*.log
+
+# Processed dataset cache (large binary — tracked via Git LFS if committed)
+# Uncomment to ignore pkl cache entirely:
+# *.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+/Data
+/prepared_smri_dataset
+/modal_training_artifacts/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.zip
+*.pt
+*.npy
+*.npz

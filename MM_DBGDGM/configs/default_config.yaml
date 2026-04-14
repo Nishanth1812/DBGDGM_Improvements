@@ -1,0 +1,55 @@
+# Default Configuration for MM-DBGDGM (ADNI Focus)
+
+# Dataset Paths
+data:
+  adni_path: "data/adni_processed"
+  batch_size: 16
+  num_workers: 4
+  mock_data: false # Set true only for quick dry-runs
+  drive_folder_url: "https://drive.google.com/drive/folders/1Qx3jqL_eSxGfWvhxb20M6orxvKsQlQT9?usp=sharing"
+  labels_csv: "labels.csv" # Optional CSV with subject_id,label columns; the JPG packager writes this file
+  max_series: 1500 # Safety cap while preprocessing from ZIP/DICOM
+  max_dicoms_per_series: 120 # Limit per-series read for speed
+  inference_holdout_ratio: 0.02 # Reserved from real dataset for post-training inference only
+  use_filename_clues: true # Prefer folders/files containing fmri/rest/bold clues
+  strict_fmri_clues: false # If true, fail when no clue-matched fMRI series are found
+  seed: 42
+
+# Model Architecture Parameters
+model:
+  n_roi: 200 # AAL-90 or Schaefer-200 etc.
+  seq_len: 50 # fMRI TR sequence length
+  n_smri_features: 5 # Structural features: cortical thickness, volume, etc.
+  latent_dim: 256
+  num_classes: 4 # CN, eMCI, lMCI, AD
+  dropout: 0.2
+  
+  # Fusion
+  use_attention_fusion: true
+  num_fusion_heads: 4
+  num_fusion_iterations: 2
+  
+  # Survival
+  survival_events: 3 # CN->eMCI, eMCI->lMCI, lMCI->AD
+
+# Training & Objective Function Configurations
+training:
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  
+  # Loss lambdas (L_total = L_class + β·L_KL + λ·L_align + λ·L_recon + λ·L_reg + λ·L_surv)
+  loss_weights:
+    lambda_kl: 0.1 # Beta (β) for disentanglement weighting
+    lambda_align: 0.5 # Cosine similarity alignment loss
+    lambda_recon: 1.0 # Reconstruction penalty
+    lambda_regression: 0.5 # Biomarker prediction weighting
+    lambda_survival: 0.7 # Survival time-to-event NLP weighting
+    
+  # Component-specific sub-weights
+  recon_weights:
+    fmri: 2.0
+    smri: 1.0
+    
+  # VAE Beta Annealing
+  kl_annealing_epochs: 10 # Increase beta from 0 to 1 over first N epochs
