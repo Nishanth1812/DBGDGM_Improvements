@@ -27,6 +27,8 @@ import yaml
 
 from prepare_smri_jpg_dataset import build_dataset as build_smri_dataset
 
+CACHE_SOURCE_KIND = "prepared_smri_jpg"
+
 
 def _read_config(config_path: Path) -> Dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as config_file:
@@ -37,6 +39,7 @@ def _compute_cache_key(config: Dict[str, Any], drive_folder_url: str) -> str:
     data_cfg = config["data"]
     model_cfg = config["model"]
     cache_key_src = "|".join([
+        CACHE_SOURCE_KIND,
         drive_folder_url,
         str(int(model_cfg["n_roi"])),
         str(int(model_cfg["seq_len"])),
@@ -135,7 +138,7 @@ def _build_samples_from_prepared_root(
 
         samples.append(sample)
 
-    return samples, []
+    return samples, [str(series_dir) for series_dir in inference_series_dirs]
 
 
 def _save_cache_payload(
@@ -149,7 +152,8 @@ def _save_cache_payload(
     cache_path = output_root / f"samples_{cache_key}.pt"
 
     cache_payload = {
-        "version": 2,
+        "version": 3,
+        "source_kind": CACHE_SOURCE_KIND,
         "samples": samples,
         "inference_series_dirs": inference_series_dirs,
         "inference_holdout_ratio": float(holdout_ratio),
@@ -182,8 +186,6 @@ def _upload_to_volume(
     with volume.batch_upload(force=True) as batch:
         batch.put_file(str(local_prepared_zip), remote_prepared_zip)
         batch.put_file(str(local_cache_path), f"{remote_cache_root}/{local_cache_path.name}")
-
-    volume.commit()
 
 
 def parse_args() -> argparse.Namespace:

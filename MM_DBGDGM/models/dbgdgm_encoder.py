@@ -47,7 +47,13 @@ class TemporalGRUEncoder(nn.Module):
             hidden: [batch_size, hidden_size*2] - final hidden state
         """
         output, hidden = self.gru(x.unsqueeze(-1))  # Add feature dim
-        hidden = hidden[-1]  # Take last layer hidden state
+
+        # GRU hidden shape: [num_layers * num_directions, batch, hidden_size].
+        # For bidirectional GRU, concatenate forward/backward states from last layer.
+        if self.gru.bidirectional:
+            hidden = torch.cat([hidden[-2], hidden[-1]], dim=1)
+        else:
+            hidden = hidden[-1]
         return output, hidden
 
 

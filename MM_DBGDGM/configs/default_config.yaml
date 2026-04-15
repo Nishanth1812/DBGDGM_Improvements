@@ -5,8 +5,11 @@ data:
   adni_path: "data/adni_processed"
   batch_size: 16
   num_workers: 4
+  preprocess_workers: 8
+  use_series_cache: true # Persist per-series preprocessed tensors in Modal volume for faster reruns
   mock_data: false # Set true only for quick dry-runs
   drive_folder_url: "https://drive.google.com/drive/folders/1Qx3jqL_eSxGfWvhxb20M6orxvKsQlQT9?usp=sharing"
+  uploaded_bundle_name: "prepared_dicom_bundle.zip" # Preferred Modal-volume bundle to use when present
   labels_csv: "labels.csv" # Optional CSV with subject_id,label columns; the JPG packager writes this file
   max_series: 1500 # Safety cap while preprocessing from ZIP/DICOM
   max_dicoms_per_series: 120 # Limit per-series read for speed
@@ -34,9 +37,14 @@ model:
 
 # Training & Objective Function Configurations
 training:
-  num_epochs: 100
+  num_epochs: 50
   learning_rate: 1e-4
   weight_decay: 1e-5
+  max_wall_time_seconds: 5400
+  pretrained_fmri_checkpoint: "" # Optional: path to best_fmri_model.pt (or full checkpoint)
+  freeze_fmri_encoder: false # Freeze only fMRI encoder during training
+  freeze_smri_encoder: false # Freeze only sMRI encoder during training
+  train_only_smri: false # Freeze all top-level modules except smri_encoder
   
   # Loss lambdas (L_total = L_class + β·L_KL + λ·L_align + λ·L_recon + λ·L_reg + λ·L_surv)
   loss_weights:
