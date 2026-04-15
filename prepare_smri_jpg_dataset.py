@@ -164,7 +164,8 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
                     "label": label,
                     "image_count": image_count,
                     "source_folder": str(class_dir),
-                    "prepared_folder": str(prepared_subject_dir),
+                    "smri_path": str(prepared_subject_dir.relative_to(output_root)),
+                    "prepared_folder": str(prepared_subject_dir.relative_to(output_root)),
                 }
             )
 
@@ -178,7 +179,7 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
     with labels_csv.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(
             csv_file,
-            fieldnames=["subject_id", "class_name", "label", "image_count", "source_folder", "prepared_folder"],
+            fieldnames=["subject_id", "class_name", "label", "image_count", "source_folder", "smri_path", "prepared_folder"],
         )
         writer.writeheader()
         writer.writerows(rows)

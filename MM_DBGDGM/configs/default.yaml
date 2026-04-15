@@ -3,10 +3,18 @@
 # Data configuration
 data:
   dataset_root: '/path/to/preprocessed_data'  # Root directory with fmri/ and smri/ subdirs
+  metadata_file: ''  # Optional single CSV manifest; when set, the loader auto-splits train/val/test
   train_metadata: '/path/to/train_metadata.csv'  # CSV: subject_id, timepoint, label
   val_metadata: '/path/to/val_metadata.csv'
   test_metadata: '/path/to/test_metadata.csv'  # Optional
+  smri_source_root: ''  # Optional local prepared SMRI JPG root; supports prepared_folder / smri_path columns
+  fmri_path_column: 'fmri_path'  # Optional explicit path column in the manifest
+  smri_path_column: 'smri_path'  # Optional explicit path column in the manifest
+  max_dicoms_per_series: 120  # Cap raw DICOM decoding per series when using extracted bundles
   normalize: true  # Normalize inputs
+  val_fraction: 0.1  # Used when metadata_file is set
+  test_fraction: 0.1  # Used when metadata_file is set
+  seed: 42
 
 # Model configuration
 model:
@@ -34,7 +42,7 @@ model:
 training:
   # Data loading
   batch_size: 32
-  num_workers: 4  # CPU workers for data loading
+  num_workers: 20  # CPU workers for data loading on the 20-vCPU VM
   
   # Optimization
   num_epochs: 100
