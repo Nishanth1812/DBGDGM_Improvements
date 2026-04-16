@@ -278,7 +278,7 @@ def _collect_subject_media(subject_root: Path) -> List[Path]:
     return sorted(
         file_path
         for file_path in subject_root.rglob("*")
-        if file_path.is_file() and (_is_image_file(file_path) or _is_dicom_file(file_path))
+        if file_path.is_file()
     )
 
 
@@ -343,7 +343,16 @@ def _load_subject_proxy_features(subject_root: Path, max_files: int = 120) -> Op
             file_sizes.append(0.0)
 
     if not slice_means:
-        return None
+        fallback = np.asarray([
+            float(len(media_files)) / 100.0,
+            float(sum(1 for path in media_files if _is_dicom_file(path))) / max(1.0, float(len(media_files))),
+            float(sum(1 for path in media_files if _is_image_file(path))) / max(1.0, float(len(media_files))),
+            float(np.mean([len(path.parts) for path in media_files])) / 100.0,
+            float(np.mean([path.stat().st_size for path in media_files if path.exists()])) / 1_000_000.0 if media_files else 0.0,
+            float(np.std([path.stat().st_size for path in media_files if path.exists()])) / 1_000_000.0 if media_files else 0.0,
+        ], dtype=np.float32)
+        fallback = np.nan_to_num(fallback, nan=0.0, posinf=0.0, neginf=0.0)
+        return fallback
 
     mean_rows = float(np.mean(row_values)) if row_values else 0.0
     mean_cols = float(np.mean(col_values)) if col_values else 0.0
