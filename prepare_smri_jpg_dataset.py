@@ -134,6 +134,10 @@ def _is_dicom_file(file_path: Path) -> bool:
     return file_path.suffix.lower() in DICOM_EXTENSIONS
 
 
+def _is_image_file(file_path: Path) -> bool:
+    return file_path.suffix.lower() in IMAGE_EXTENSIONS
+
+
 def _resolve_class_dir(input_root: Path, class_name: str) -> Path | None:
     aliases = {
         "Non Demented": ("Non Demented", "Non-Demented", "Non_Demented", "NonDemented", "CN", "Control", "Healthy Control"),
