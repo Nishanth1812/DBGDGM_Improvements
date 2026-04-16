@@ -929,7 +929,7 @@ def main() -> Dict[str, Any]:
 
     test_results: Dict[str, Any] = {}
     if test_loader is not None and len(test_loader) > 0:
-        best_checkpoint_path = output_dir / "best_loss.pt"
+        best_checkpoint_path = output_dir / "best_model.pt"
         if best_checkpoint_path.exists():
             logger.info(f"Evaluating best checkpoint on the held-out test set: {best_checkpoint_path}")
             test_results = trainer.test(

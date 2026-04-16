@@ -762,34 +762,36 @@ class Trainer:
                 val_acc = val_metrics['val_accuracy']
 
                 if val_loss < self.best_val_loss:
-                    logger.info(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}; saving checkpoints")
+                    logger.info(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}")
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
-                    self._save_checkpoint(epoch, optimizer, 'best_loss')
-                    self._save_best_component_models(
-                        epoch=epoch,
-                        metric_name='val_loss',
-                        metric_value=val_loss,
-                    )
                     logger.info(f"New best validation loss: {val_loss:.4f}")
                 else:
                     self.patience_counter += 1
 
-                if val_acc > self.best_val_acc:
-                    logger.info(f"Validation accuracy improved from {self.best_val_acc:.4f} to {val_acc:.4f}; saving accuracy checkpoint")
+                save_best_model = (
+                    val_acc > self.best_val_acc
+                    or (abs(val_acc - self.best_val_acc) <= 1e-12 and val_loss <= self.best_val_loss)
+                )
+                if save_best_model:
+                    logger.info(
+                        f"Validation accuracy improved from {self.best_val_acc:.4f} to {val_acc:.4f}; "
+                        "saving the single best checkpoint"
+                    )
                     self.best_val_acc = val_acc
-                    self._save_checkpoint(epoch, optimizer, 'best_acc')
-                    logger.info(f"New best validation accuracy: {val_acc:.4f}")
+                    self._save_checkpoint(
+                        epoch,
+                        optimizer,
+                        'best_model',
+                        metric_name='val_accuracy',
+                        metric_value=val_acc,
+                    )
+                    logger.info(f"Best model checkpoint updated at validation accuracy {val_acc:.4f}")
 
                 # Early stopping
                 if self.patience_counter >= patience:
                     logger.info(f"Early stopping after {epoch + 1} epochs")
                     break
-
-                # Save regular checkpoint
-                if (epoch + 1) % 5 == 0:
-                    logger.info(f"Saving periodic checkpoint for epoch {epoch + 1}")
-                    self._save_checkpoint(epoch, optimizer, f'epoch_{epoch}')
 
             logger.info("Training completed!")
             self._save_history()
@@ -800,7 +802,9 @@ class Trainer:
         self,
         epoch: int,
         optimizer: torch.optim.Optimizer,
-        name: str = 'checkpoint'
+        name: str = 'checkpoint',
+        metric_name: Optional[str] = None,
+        metric_value: Optional[float] = None,
     ):
         """Save model checkpoint."""
         checkpoint_path = self.output_dir / f"{name}.pt"
@@ -808,88 +812,19 @@ class Trainer:
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
-            'component_state_dicts': self._collect_component_state_dicts(),
             'optimizer_state_dict': optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'best_val_acc': self.best_val_acc,
             'timestamp': datetime.now().isoformat()
         }
+
+        if metric_name is not None:
+            checkpoint['metric_name'] = metric_name
+        if metric_value is not None:
+            checkpoint['metric_value'] = float(metric_value)
         
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved: {checkpoint_path}")
-
-    def _collect_component_state_dicts(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Collect component-level state dicts for transfer/fine-tuning workflows."""
-        component_state_dicts: Dict[str, Dict[str, torch.Tensor]] = {}
-
-        for module_name in ('fmri_encoder', 'smri_encoder'):
-            module = getattr(self.model, module_name, None)
-            if module is not None:
-                component_state_dicts[module_name] = module.state_dict()
-
-        return component_state_dicts
-
-    def _save_best_component_models(
-        self,
-        epoch: int,
-        metric_name: str,
-        metric_value: float,
-    ) -> None:
-        """Persist best component checkpoints for modality-specific fine-tuning."""
-        timestamp = datetime.now().isoformat()
-        component_state_dicts = self._collect_component_state_dicts()
-
-        fmri_state_dict = component_state_dicts.get('fmri_encoder')
-        if fmri_state_dict is not None:
-            fmri_path = self.output_dir / 'best_fmri_model.pt'
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'component_name': 'fmri_encoder',
-                    'fmri_encoder_state_dict': fmri_state_dict,
-                    'source_metric_name': metric_name,
-                    'source_metric_value': float(metric_value),
-                    'best_val_loss': self.best_val_loss,
-                    'best_val_acc': self.best_val_acc,
-                    'timestamp': timestamp,
-                },
-                fmri_path,
-            )
-            logger.info(f"Best fMRI checkpoint saved: {fmri_path}")
-
-        smri_state_dict = component_state_dicts.get('smri_encoder')
-        if smri_state_dict is not None:
-            smri_path = self.output_dir / 'best_smri_model.pt'
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'component_name': 'smri_encoder',
-                    'smri_encoder_state_dict': smri_state_dict,
-                    'source_metric_name': metric_name,
-                    'source_metric_value': float(metric_value),
-                    'best_val_loss': self.best_val_loss,
-                    'best_val_acc': self.best_val_acc,
-                    'timestamp': timestamp,
-                },
-                smri_path,
-            )
-            logger.info(f"Best sMRI checkpoint saved: {smri_path}")
-
-        final_path = self.output_dir / 'best_final_model.pt'
-        torch.save(
-            {
-                'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
-                'component_state_dicts': component_state_dicts,
-                'source_metric_name': metric_name,
-                'source_metric_value': float(metric_value),
-                'best_val_loss': self.best_val_loss,
-                'best_val_acc': self.best_val_acc,
-                'timestamp': timestamp,
-            },
-            final_path,
-        )
-        logger.info(f"Best final-model checkpoint saved: {final_path}")
     
     def _save_history(self):
         """Save training history."""
