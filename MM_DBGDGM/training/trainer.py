@@ -655,22 +655,26 @@ class Trainer:
         logger.info(f"Trainable parameters for optimizer: {trainable_count:,}")
 
         # Optimizer and scheduler
+        logger.info("Building optimizer")
         optimizer = Adam(
             trainable_parameters,
             lr=learning_rate,
             weight_decay=weight_decay
         )
+        logger.info("Optimizer ready")
         
         # Load optimizer state if resuming
         if resume_optimizer_state is not None:
             optimizer.load_state_dict(resume_optimizer_state)
             logger.info("Resumed optimizer state from checkpoint")
         
+        logger.info("Building learning-rate scheduler")
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=num_epochs,
             eta_min=learning_rate * 0.01
         )
+        logger.info("Scheduler ready")
         
         # Step scheduler to current epoch if resuming
         for _ in range(start_epoch):
@@ -679,6 +683,7 @@ class Trainer:
         training_start = time.perf_counter()
         self._start_heartbeat()
         logger.info("Heartbeat progress updates will appear every 30 seconds while a batch is active")
+        logger.info("Training runtime monitor enabled; waiting for epoch 1 to begin")
         try:
             # Training loop
             for epoch in range(start_epoch, num_epochs):
@@ -700,6 +705,10 @@ class Trainer:
                     f"Epoch {epoch + 1}/{num_epochs} starting | beta={beta:.4f} | "
                     f"best_val_loss={self.best_val_loss:.4f} | best_val_acc={self.best_val_acc:.4f}"
                 )
+                logger.info(
+                    f"Epoch {epoch + 1}: entering training phase | train_batches={len(train_loader)} | "
+                    f"val_batches={len(val_loader)}"
+                )
 
                 self._set_progress(
                     phase='epoch',
@@ -717,6 +726,7 @@ class Trainer:
                     beta_annealing=beta,
                     log_every_n_batches=log_every_n_batches,
                 )
+                logger.info(f"Epoch {epoch + 1}: training phase complete; starting validation")
 
                 # Validate
                 val_metrics = self.validate(
@@ -725,6 +735,7 @@ class Trainer:
                     beta_annealing=beta,
                     log_every_n_batches=log_every_n_batches,
                 )
+                logger.info(f"Epoch {epoch + 1}: validation phase complete")
 
                 # Learning rate scheduling
                 scheduler.step()
@@ -738,7 +749,7 @@ class Trainer:
                     f"Train Acc: {train_metrics['train_accuracy']:.4f} | "
                     f"Val Loss: {val_metrics['val_total']:.4f}, "
                     f"Val Acc: {val_metrics['val_accuracy']:.4f} | "
-                    f"β: {beta:.4f} | lr: {current_lr:.6g} | "
+                    f"beta: {beta:.4f} | lr: {current_lr:.6g} | "
                     f"Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
                 )
 
@@ -760,7 +771,7 @@ class Trainer:
                         metric_name='val_loss',
                         metric_value=val_loss,
                     )
-                    logger.info(f"✓ New best validation loss: {val_loss:.4f}")
+                    logger.info(f"New best validation loss: {val_loss:.4f}")
                 else:
                     self.patience_counter += 1
 
@@ -768,7 +779,7 @@ class Trainer:
                     logger.info(f"Validation accuracy improved from {self.best_val_acc:.4f} to {val_acc:.4f}; saving accuracy checkpoint")
                     self.best_val_acc = val_acc
                     self._save_checkpoint(epoch, optimizer, 'best_acc')
-                    logger.info(f"✓ New best validation accuracy: {val_acc:.4f}")
+                    logger.info(f"New best validation accuracy: {val_acc:.4f}")
 
                 # Early stopping
                 if self.patience_counter >= patience:
