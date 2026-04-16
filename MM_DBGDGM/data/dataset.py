@@ -103,10 +103,15 @@ def _series_has_fmri_clue(series_dir: Path) -> bool:
 
 def _extract_subject_id_from_series(series_dir: Path) -> str:
     parts = list(series_dir.parts)
-    if "ADNI" in parts:
-        idx = parts.index("ADNI")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
+
+    # Prefer explicit ADNI subject ids wherever they appear in the path.
+    for part in parts:
+        if re.search(r"(?i)^\d{3}_S_\d{4}$", part):
+            return part
+
+    adni_index = next((idx for idx, part in enumerate(parts) if part.casefold() == "adni"), None)
+    if adni_index is not None and adni_index + 1 < len(parts):
+        return parts[adni_index + 1]
 
     folder_name = series_dir.name.strip()
     if folder_name:
@@ -673,6 +678,10 @@ class MultimodalBrainDataset(Dataset):
         if smri_path_value:
             candidate = _resolve_relative_path(smri_path_value, self.metadata_base_dir)
             if candidate is not None and candidate.exists():
+                if candidate.is_dir():
+                    direct_features = candidate / 'features.npy'
+                    if direct_features.exists():
+                        return direct_features
                 return candidate
 
         subject_id = _string_or_empty(sample.get('subject_id'))
@@ -695,21 +704,29 @@ class MultimodalBrainDataset(Dataset):
 
             existing = _first_existing_path(candidates)
             if existing is not None:
+                if existing.is_dir():
+                    direct_features = existing / 'features.npy'
+                    if direct_features.exists():
+                        return direct_features
                 return existing
 
             if root.exists():
                 search_matches = [path for path in sorted(root.rglob(subject_id)) if path.is_dir()]
                 if search_matches:
+                    direct_features = search_matches[0] / 'features.npy'
+                    if direct_features.exists():
+                        return direct_features
                     return search_matches[0]
 
         return None
     
-    def _load_fmri(self, subject_id: str, timepoint: str) -> Optional[torch.Tensor]:
+    def _load_fmri(self, sample: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Load fMRI data."""
         if 'fmri' not in self.modalities:
             return None
 
-        sample = {'subject_id': subject_id, 'timepoint': timepoint}
+        subject_id = _string_or_empty(sample.get('subject_id'))
+        timepoint = _string_or_empty(sample.get('timepoint'))
         fmri_source = self._resolve_fmri_source(sample)
         if fmri_source is None or not fmri_source.exists():
             logger.warning(f"fMRI file not found: {fmri_source}")
@@ -761,18 +778,23 @@ class MultimodalBrainDataset(Dataset):
             logger.error(f"Failed to load fMRI {fmri_source}: {e}")
             return None
     
-    def _load_smri(self, subject_id: str, timepoint: str) -> Optional[torch.Tensor]:
+    def _load_smri(self, sample: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Load sMRI data."""
         if 'smri' not in self.modalities:
             return None
 
-        sample = {'subject_id': subject_id, 'timepoint': timepoint}
+        subject_id = _string_or_empty(sample.get('subject_id'))
         smri_source = self._resolve_smri_source(sample)
         if smri_source is None:
             logger.warning(f"sMRI file or folder not found for subject: {subject_id}")
             return None
 
         try:
+            if smri_source.is_dir():
+                direct_features = smri_source / 'features.npy'
+                if direct_features.exists():
+                    smri_source = direct_features
+
             if smri_source.is_file() and smri_source.suffix.lower() == '.npy':
                 smri_data = np.load(str(smri_source)).astype(np.float32)
 
@@ -832,8 +854,8 @@ class MultimodalBrainDataset(Dataset):
         }
 
         # Load modalities
-        fmri = self._load_fmri(subject_id, timepoint)
-        smri = self._load_smri(subject_id, timepoint)
+        fmri = self._load_fmri(sample)
+        smri = self._load_smri(sample)
 
         if fmri is None or smri is None:
             raise ValueError(

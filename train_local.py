@@ -412,13 +412,25 @@ def _prepared_smri_reuse_matches(prepared_smri_root: Path, raw_smri_root: Path, 
     if not marker:
         return False
 
-    expected = {
+    expected_labels_signature = _source_signature(labels_csv) if labels_csv is not None and labels_csv.exists() else None
+
+    expected_train_local_marker = {
         "kind": "prepared_smri_dataset",
         "source_root": str(raw_smri_root.resolve()),
         "source_root_signature": _source_signature(raw_smri_root),
-        "labels_csv_signature": _source_signature(labels_csv) if labels_csv is not None and labels_csv.exists() else None,
+        "labels_csv_signature": expected_labels_signature,
     }
-    return marker == expected
+    if marker == expected_train_local_marker:
+        return True
+
+    # Backward/side-channel compatibility: `prepare_smri_jpg_dataset.py` stores
+    # source metadata without the train-local marker envelope.
+    expected_builder_marker = {
+        "input_root": str(raw_smri_root.resolve()),
+        "input_root_signature": _source_signature(raw_smri_root),
+        "labels_csv_signature": expected_labels_signature,
+    }
+    return marker == expected_builder_marker
 
 
 def _has_dicom_files(root_dir: Path) -> bool:
