@@ -378,15 +378,6 @@ def _prepare_raw_zip_inputs(
     prepared_smri_root = _find_prepared_smri_root(smri_extract_root)
     if prepared_smri_root is None:
         raw_smri_root = smri_extract_root
-        while True:
-            class_dirs_present = all((raw_smri_root / class_name).is_dir() for class_name, _ in DEFAULT_CLASS_LABELS)
-            if class_dirs_present:
-                break
-            child_dirs = [path for path in sorted(raw_smri_root.iterdir()) if path.is_dir()]
-            if len(child_dirs) != 1:
-                break
-            raw_smri_root = child_dirs[0]
-
         logger.info(f"Rebuilding prepared SMRI dataset from raw folders: {raw_smri_root}")
         prepared_smri_root = work_dir / "prepared_smri_dataset"
         build_smri_dataset(

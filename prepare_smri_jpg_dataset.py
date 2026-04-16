@@ -50,6 +50,42 @@ DEFAULT_CLASS_LABELS: List[Tuple[str, int]] = [
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def _normalize_folder_name(name: str) -> str:
+    return " ".join(str(name).replace("_", " ").replace("-", " ").split()).casefold()
+
+
+def _resolve_class_dir(input_root: Path, class_name: str) -> Path | None:
+    aliases = {
+        "Non Demented": ("Non Demented", "Non-Demented", "Non_Demented", "NonDemented", "CN", "Control", "Healthy Control"),
+        "Very mild Dementia": ("Very mild Dementia", "Very Mild Dementia", "Very-mild Dementia", "eMCI", "EMCI", "MCI"),
+        "Mild Dementia": ("Mild Dementia", "Mild-dementia", "lMCI", "LMCI"),
+        "Moderate Dementia": ("Moderate Dementia", "Moderate-dementia", "AD", "Alzheimer", "Demented"),
+    }
+
+    candidate_names = (class_name, *aliases.get(class_name, ()))
+    normalized_candidates = {_normalize_folder_name(name) for name in candidate_names}
+
+    direct_candidate = input_root / class_name
+    if direct_candidate.is_dir():
+        return direct_candidate
+
+    for candidate_name in candidate_names[1:]:
+        candidate_dir = input_root / candidate_name
+        if candidate_dir.is_dir():
+            return candidate_dir
+
+    matched_dirs: List[Path] = []
+    for child_dir in input_root.rglob("*"):
+        if child_dir.is_dir() and _normalize_folder_name(child_dir.name) in normalized_candidates:
+            matched_dirs.append(child_dir)
+
+    if not matched_dirs:
+        return None
+
+    matched_dirs.sort(key=lambda path: (len(path.relative_to(input_root).parts), str(path).lower()))
+    return matched_dirs[0]
+
+
 def _infer_subject_id(image_path: Path) -> str:
     """Infer a subject-level identifier from an image filename."""
 
@@ -127,10 +163,13 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
     total_images = 0
     total_subjects = 0
 
+    missing_class_dirs: List[str] = []
+
     for class_name, label in DEFAULT_CLASS_LABELS:
-        class_dir = input_root / class_name
-        if not class_dir.exists():
-            raise FileNotFoundError(f"Expected class folder missing: {class_dir}")
+        class_dir = _resolve_class_dir(input_root, class_name)
+        if class_dir is None:
+            missing_class_dirs.append(class_name)
+            continue
 
         grouped_images: Dict[str, List[Path]] = defaultdict(list)
         for image_path in _collect_images(class_dir):
@@ -174,6 +213,13 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
             "subjects": len(grouped_images),
             "images": class_image_count,
         }
+
+    if missing_class_dirs:
+        available_dirs = [str(path) for path in sorted(path for path in input_root.rglob("*") if path.is_dir())[:50]]
+        raise FileNotFoundError(
+            "Could not resolve the expected class folders under "
+            f"{input_root}: {missing_class_dirs}. Available directories include: {available_dirs}"
+        )
 
     labels_csv = output_root / "labels.csv"
     with labels_csv.open("w", newline="", encoding="utf-8") as csv_file:
