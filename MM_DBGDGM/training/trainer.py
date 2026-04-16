@@ -177,7 +177,7 @@ class Trainer:
     def _clear_progress(self) -> None:
         self._set_progress('idle')
 
-    def _start_heartbeat(self, interval_seconds: float = 60.0) -> None:
+    def _start_heartbeat(self, interval_seconds: float = 30.0) -> None:
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             return
 
@@ -259,6 +259,12 @@ class Trainer:
         for batch_idx, batch in enumerate(train_loader):
             batch_number = batch_idx + 1
             batch_start = time.perf_counter()
+
+            if batch_number == 1:
+                logger.info(
+                    f"Epoch {epoch_number}: beginning batch loop; batch 1 is loading and may take a while "
+                    f"before the first loss log appears"
+                )
 
             self._set_progress(
                 phase='train_prepare',
@@ -376,6 +382,12 @@ class Trainer:
         
         for batch_idx, batch in enumerate(val_loader):
             batch_number = batch_idx + 1
+
+            if batch_number == 1:
+                logger.info(
+                    f"Epoch {epoch_number}: beginning validation batch loop; batch 1 is loading"
+                )
+
             self._set_progress(
                 phase='val_prepare',
                 epoch=epoch_number,
@@ -483,6 +495,10 @@ class Trainer:
 
         for batch_idx, batch in enumerate(test_loader):
             batch_number = batch_idx + 1
+
+            if batch_number == 1:
+                logger.info("Testing: beginning batch loop; batch 1 is loading")
+
             self._set_progress(
                 phase='test_prepare',
                 epoch=None,
@@ -639,22 +655,26 @@ class Trainer:
         logger.info(f"Trainable parameters for optimizer: {trainable_count:,}")
 
         # Optimizer and scheduler
+        logger.info("Building optimizer")
         optimizer = Adam(
             trainable_parameters,
             lr=learning_rate,
             weight_decay=weight_decay
         )
+        logger.info("Optimizer ready")
         
         # Load optimizer state if resuming
         if resume_optimizer_state is not None:
             optimizer.load_state_dict(resume_optimizer_state)
             logger.info("Resumed optimizer state from checkpoint")
         
+        logger.info("Building learning-rate scheduler")
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=num_epochs,
             eta_min=learning_rate * 0.01
         )
+        logger.info("Scheduler ready")
         
         # Step scheduler to current epoch if resuming
         for _ in range(start_epoch):
@@ -662,6 +682,8 @@ class Trainer:
         
         training_start = time.perf_counter()
         self._start_heartbeat()
+        logger.info("Heartbeat progress updates will appear every 30 seconds while a batch is active")
+        logger.info("Training runtime monitor enabled; waiting for epoch 1 to begin")
         try:
             # Training loop
             for epoch in range(start_epoch, num_epochs):
@@ -683,6 +705,10 @@ class Trainer:
                     f"Epoch {epoch + 1}/{num_epochs} starting | beta={beta:.4f} | "
                     f"best_val_loss={self.best_val_loss:.4f} | best_val_acc={self.best_val_acc:.4f}"
                 )
+                logger.info(
+                    f"Epoch {epoch + 1}: entering training phase | train_batches={len(train_loader)} | "
+                    f"val_batches={len(val_loader)}"
+                )
 
                 self._set_progress(
                     phase='epoch',
@@ -700,6 +726,7 @@ class Trainer:
                     beta_annealing=beta,
                     log_every_n_batches=log_every_n_batches,
                 )
+                logger.info(f"Epoch {epoch + 1}: training phase complete; starting validation")
 
                 # Validate
                 val_metrics = self.validate(
@@ -708,6 +735,7 @@ class Trainer:
                     beta_annealing=beta,
                     log_every_n_batches=log_every_n_batches,
                 )
+                logger.info(f"Epoch {epoch + 1}: validation phase complete")
 
                 # Learning rate scheduling
                 scheduler.step()
@@ -721,7 +749,7 @@ class Trainer:
                     f"Train Acc: {train_metrics['train_accuracy']:.4f} | "
                     f"Val Loss: {val_metrics['val_total']:.4f}, "
                     f"Val Acc: {val_metrics['val_accuracy']:.4f} | "
-                    f"β: {beta:.4f} | lr: {current_lr:.6g} | "
+                    f"beta: {beta:.4f} | lr: {current_lr:.6g} | "
                     f"Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
                 )
 
@@ -734,34 +762,36 @@ class Trainer:
                 val_acc = val_metrics['val_accuracy']
 
                 if val_loss < self.best_val_loss:
-                    logger.info(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}; saving checkpoints")
+                    logger.info(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}")
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
-                    self._save_checkpoint(epoch, optimizer, 'best_loss')
-                    self._save_best_component_models(
-                        epoch=epoch,
-                        metric_name='val_loss',
-                        metric_value=val_loss,
-                    )
-                    logger.info(f"✓ New best validation loss: {val_loss:.4f}")
+                    logger.info(f"New best validation loss: {val_loss:.4f}")
                 else:
                     self.patience_counter += 1
 
-                if val_acc > self.best_val_acc:
-                    logger.info(f"Validation accuracy improved from {self.best_val_acc:.4f} to {val_acc:.4f}; saving accuracy checkpoint")
+                save_best_model = (
+                    val_acc > self.best_val_acc
+                    or (abs(val_acc - self.best_val_acc) <= 1e-12 and val_loss <= self.best_val_loss)
+                )
+                if save_best_model:
+                    logger.info(
+                        f"Validation accuracy improved from {self.best_val_acc:.4f} to {val_acc:.4f}; "
+                        "saving the single best checkpoint"
+                    )
                     self.best_val_acc = val_acc
-                    self._save_checkpoint(epoch, optimizer, 'best_acc')
-                    logger.info(f"✓ New best validation accuracy: {val_acc:.4f}")
+                    self._save_checkpoint(
+                        epoch,
+                        optimizer,
+                        'best_model',
+                        metric_name='val_accuracy',
+                        metric_value=val_acc,
+                    )
+                    logger.info(f"Best model checkpoint updated at validation accuracy {val_acc:.4f}")
 
                 # Early stopping
                 if self.patience_counter >= patience:
                     logger.info(f"Early stopping after {epoch + 1} epochs")
                     break
-
-                # Save regular checkpoint
-                if (epoch + 1) % 5 == 0:
-                    logger.info(f"Saving periodic checkpoint for epoch {epoch + 1}")
-                    self._save_checkpoint(epoch, optimizer, f'epoch_{epoch}')
 
             logger.info("Training completed!")
             self._save_history()
@@ -772,7 +802,9 @@ class Trainer:
         self,
         epoch: int,
         optimizer: torch.optim.Optimizer,
-        name: str = 'checkpoint'
+        name: str = 'checkpoint',
+        metric_name: Optional[str] = None,
+        metric_value: Optional[float] = None,
     ):
         """Save model checkpoint."""
         checkpoint_path = self.output_dir / f"{name}.pt"
@@ -780,88 +812,19 @@ class Trainer:
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
-            'component_state_dicts': self._collect_component_state_dicts(),
             'optimizer_state_dict': optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'best_val_acc': self.best_val_acc,
             'timestamp': datetime.now().isoformat()
         }
+
+        if metric_name is not None:
+            checkpoint['metric_name'] = metric_name
+        if metric_value is not None:
+            checkpoint['metric_value'] = float(metric_value)
         
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved: {checkpoint_path}")
-
-    def _collect_component_state_dicts(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Collect component-level state dicts for transfer/fine-tuning workflows."""
-        component_state_dicts: Dict[str, Dict[str, torch.Tensor]] = {}
-
-        for module_name in ('fmri_encoder', 'smri_encoder'):
-            module = getattr(self.model, module_name, None)
-            if module is not None:
-                component_state_dicts[module_name] = module.state_dict()
-
-        return component_state_dicts
-
-    def _save_best_component_models(
-        self,
-        epoch: int,
-        metric_name: str,
-        metric_value: float,
-    ) -> None:
-        """Persist best component checkpoints for modality-specific fine-tuning."""
-        timestamp = datetime.now().isoformat()
-        component_state_dicts = self._collect_component_state_dicts()
-
-        fmri_state_dict = component_state_dicts.get('fmri_encoder')
-        if fmri_state_dict is not None:
-            fmri_path = self.output_dir / 'best_fmri_model.pt'
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'component_name': 'fmri_encoder',
-                    'fmri_encoder_state_dict': fmri_state_dict,
-                    'source_metric_name': metric_name,
-                    'source_metric_value': float(metric_value),
-                    'best_val_loss': self.best_val_loss,
-                    'best_val_acc': self.best_val_acc,
-                    'timestamp': timestamp,
-                },
-                fmri_path,
-            )
-            logger.info(f"Best fMRI checkpoint saved: {fmri_path}")
-
-        smri_state_dict = component_state_dicts.get('smri_encoder')
-        if smri_state_dict is not None:
-            smri_path = self.output_dir / 'best_smri_model.pt'
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'component_name': 'smri_encoder',
-                    'smri_encoder_state_dict': smri_state_dict,
-                    'source_metric_name': metric_name,
-                    'source_metric_value': float(metric_value),
-                    'best_val_loss': self.best_val_loss,
-                    'best_val_acc': self.best_val_acc,
-                    'timestamp': timestamp,
-                },
-                smri_path,
-            )
-            logger.info(f"Best sMRI checkpoint saved: {smri_path}")
-
-        final_path = self.output_dir / 'best_final_model.pt'
-        torch.save(
-            {
-                'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
-                'component_state_dicts': component_state_dicts,
-                'source_metric_name': metric_name,
-                'source_metric_value': float(metric_value),
-                'best_val_loss': self.best_val_loss,
-                'best_val_acc': self.best_val_acc,
-                'timestamp': timestamp,
-            },
-            final_path,
-        )
-        logger.info(f"Best final-model checkpoint saved: {final_path}")
     
     def _save_history(self):
         """Save training history."""

@@ -140,9 +140,12 @@ def main(args):
     # Test (if test data available)
     if test_loader:
         logger.info("Loading best model for testing...")
-        best_model_path = output_dir / 'best_loss.pt'
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        best_model_path = output_dir / 'best_model.pt'
+        if best_model_path.exists():
+            checkpoint = torch.load(best_model_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            logger.warning(f"Best model checkpoint not found at {best_model_path}; testing current model weights")
         
         logger.info("Running on test set...")
         test_metrics = trainer.validate(test_loader, epoch=0, beta_annealing=1.0)
