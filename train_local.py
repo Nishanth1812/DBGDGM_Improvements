@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import inspect
 import os
 import json
 import logging
@@ -662,7 +663,7 @@ def main() -> Dict[str, Any]:
     logger.info(f"Max wall-clock budget: {max_wall_time_seconds / 60:.1f} minutes")
 
     logger.info("Initializing model")
-    model = MM_DBGDGM(
+    model_kwargs = {
         n_roi=int(model_cfg.get("n_roi", 200)),
         seq_len=int(model_cfg.get("seq_len", 50)),
         gru_hidden=int(model_cfg.get("gru_hidden", 128)),
@@ -676,7 +677,19 @@ def main() -> Dict[str, Any]:
         num_fusion_heads=int(model_cfg.get("num_fusion_heads", 4)),
         num_fusion_iterations=int(model_cfg.get("num_fusion_iterations", 2)),
         dropout=float(model_cfg.get("dropout", 0.1)),
-    ).to(device)
+    }
+
+    constructor_signature = inspect.signature(MM_DBGDGM.__init__)
+    supported_keys = {key for key in constructor_signature.parameters.keys() if key != "self"}
+    filtered_model_kwargs = {key: value for key, value in model_kwargs.items() if key in supported_keys}
+    dropped_model_kwargs = sorted(key for key in model_kwargs.keys() if key not in supported_keys)
+    if dropped_model_kwargs:
+        logger.warning(
+            f"Dropping unsupported MM_DBGDGM args: {dropped_model_kwargs}. "
+            f"Supported keys are: {sorted(supported_keys)}"
+        )
+
+    model = MM_DBGDGM(**filtered_model_kwargs).to(device)
 
     total_params = sum(parameter.numel() for parameter in model.parameters())
     trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
