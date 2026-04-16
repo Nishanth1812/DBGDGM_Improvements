@@ -345,6 +345,14 @@ def _find_prepared_smri_root(extracted_smri_root: Path) -> Optional[Path]:
     return None
 
 
+def _find_any_labels_csv(*roots: Path) -> Optional[Path]:
+    for root in roots:
+        labels_csv = _find_labels_csv(root)
+        if labels_csv is not None:
+            return labels_csv
+    return None
+
+
 def _has_dicom_files(root_dir: Path) -> bool:
     for file_path in root_dir.rglob("*"):
         if not file_path.is_file():
@@ -403,6 +411,13 @@ def _prepare_raw_zip_inputs(
     prepared_smri_root = _find_prepared_smri_root(smri_extract_root)
     if prepared_smri_root is None:
         raw_smri_root = smri_extract_root
+        labels_csv = _find_any_labels_csv(dicom_extract_root, smri_extract_root)
+        if labels_csv is None:
+            logger.warning(
+                "No labels.csv found in the raw inputs; raw ADNI SMRI preparation will require labels from the archive"
+            )
+        else:
+            logger.info(f"Using labels CSV for raw SMRI preparation: {labels_csv}")
         logger.info(f"Rebuilding prepared SMRI dataset from raw folders: {raw_smri_root}")
         prepared_smri_root = work_dir / "prepared_smri_dataset"
         build_smri_dataset(
@@ -410,6 +425,7 @@ def _prepare_raw_zip_inputs(
             output_root=prepared_smri_root,
             transfer_mode="hardlink",
             overwrite=True,
+            labels_csv=labels_csv,
             logger=logger,
         )
 

@@ -8,8 +8,28 @@ Input layout expected:
         Mild Dementia/
         Moderate Dementia/
 
-The script groups JPGs by subject prefix extracted from the filename, then
-rebuilds the dataset as:
+The script can rebuild either:
+
+1. Class-folder JPG datasets like:
+
+    Data/
+        Non Demented/
+        Very mild Dementia/
+        Mild Dementia/
+        Moderate Dementia/
+
+2. Raw ADNI subject trees like:
+
+    Data/
+        ADNI/
+            002_S_0295/
+                ...
+
+In class-folder mode, JPGs are grouped by subject prefix extracted from the
+filename. In raw ADNI mode, JPGs are grouped by subject id extracted from the
+directory tree and labels are loaded from a labels CSV when available.
+
+The dataset is rebuilt as:
 
     prepared_smri_dataset/
         labels.csv
@@ -88,6 +108,99 @@ def _resolve_class_dir(input_root: Path, class_name: str) -> Path | None:
     return matched_dirs[0]
 
 
+def _extract_subject_id_from_path(image_path: Path) -> str:
+    parts = list(image_path.parts)
+    if "ADNI" in parts:
+        index = parts.index("ADNI")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+
+    parent_name = image_path.parent.name.strip()
+    if parent_name:
+        return parent_name
+
+    return _infer_subject_id(image_path)
+
+
+def _find_subject_root_from_path(image_path: Path, input_root: Path) -> Path:
+    parts = list(image_path.parts)
+    if "ADNI" in parts:
+        index = parts.index("ADNI")
+        if index + 1 < len(parts):
+            subject_root = Path(*parts[: index + 2])
+            if subject_root.exists():
+                return subject_root
+
+    return image_path.parent
+
+
+def _load_label_map(labels_csv_path: Path | None, log: logging.Logger) -> Dict[str, int]:
+    if labels_csv_path is None:
+        return {}
+
+    if not labels_csv_path.exists():
+        log.warning(f"labels CSV not found at {labels_csv_path}; labels must come from the source tree")
+        return {}
+
+    label_map: Dict[str, int] = {}
+    with labels_csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            subject_id = str(row.get("subject_id", row.get("Subject", row.get("PTID", row.get("RID", ""))))).strip()
+            if not subject_id:
+                continue
+
+            raw_label = row.get("label", row.get("Label", row.get("diagnosis", row.get("Diagnosis", row.get("DX", "")))))
+            try:
+                label_map[subject_id] = int(raw_label)
+                continue
+            except Exception:
+                pass
+
+            label_text = _normalize_folder_name(raw_label)
+            stage_map = {
+                "cn": 0,
+                "non demented": 0,
+                "control": 0,
+                "healthy control": 0,
+                "emci": 1,
+                "very mild dementia": 1,
+                "mci": 1,
+                "lmci": 2,
+                "mild dementia": 2,
+                "ad": 3,
+                "alzheimer": 3,
+                "moderate dementia": 3,
+            }
+            if label_text in stage_map:
+                label_map[subject_id] = stage_map[label_text]
+
+    log.info(f"Loaded {len(label_map)} subject label(s) from {labels_csv_path}")
+    return label_map
+
+
+def _class_name_for_label(label: int) -> str:
+    label_to_class = {class_label: class_name for class_name, class_label in DEFAULT_CLASS_LABELS}
+    if label not in label_to_class:
+        raise ValueError(f"Unsupported label {label}; expected one of {sorted(label_to_class)}")
+    return label_to_class[label]
+
+
+def _copy_subject_images(
+    subject_images: List[Path],
+    subject_root: Path,
+    prepared_subject_dir: Path,
+    transfer_mode: str,
+) -> None:
+    for image_path in subject_images:
+        try:
+            relative_path = image_path.relative_to(subject_root)
+            destination = prepared_subject_dir / relative_path
+        except Exception:
+            destination = prepared_subject_dir / image_path.name
+        _safe_transfer(image_path, destination, transfer_mode)
+
+
 def _infer_subject_id(image_path: Path) -> str:
     """Infer a subject-level identifier from an image filename."""
 
@@ -153,6 +266,7 @@ def build_dataset(
     output_root: Path,
     transfer_mode: str,
     overwrite: bool,
+    labels_csv: Path | None = None,
     logger: logging.Logger | None = None,
 ) -> Dict[str, object]:
     log = logger or logging.getLogger("smri-prep")
@@ -162,7 +276,7 @@ def build_dataset(
 
     log.info(
         f"Preparing SMRI dataset | input_root={input_root} | output_root={output_root} | "
-        f"transfer_mode={transfer_mode} | overwrite={overwrite}"
+        f"transfer_mode={transfer_mode} | overwrite={overwrite} | labels_csv={labels_csv if labels_csv else '<none>'}"
     )
 
     class_labels = dict(DEFAULT_CLASS_LABELS)
@@ -177,8 +291,10 @@ def build_dataset(
     class_summary: Dict[str, Dict[str, int]] = {}
     total_images = 0
     total_subjects = 0
+    label_map = _load_label_map(labels_csv, log)
 
     missing_class_dirs: List[str] = []
+    resolved_class_dirs: Dict[str, Path] = {}
 
     for class_name, label in DEFAULT_CLASS_LABELS:
         class_dir = _resolve_class_dir(input_root, class_name)
@@ -186,6 +302,8 @@ def build_dataset(
             log.warning(f"Could not resolve class folder for '{class_name}' under {input_root}")
             missing_class_dirs.append(class_name)
             continue
+
+        resolved_class_dirs[class_name] = class_dir
 
         log.info(f"Scanning class '{class_name}' from {class_dir}")
 
@@ -249,12 +367,81 @@ def build_dataset(
             f"Finished class '{class_name}' | subjects={len(grouped_images)} | images={class_image_count}"
         )
 
-    if missing_class_dirs:
-        available_dirs = [str(path) for path in sorted(path for path in input_root.rglob("*") if path.is_dir())[:50]]
-        raise FileNotFoundError(
-            "Could not resolve the expected class folders under "
-            f"{input_root}: {missing_class_dirs}. Available directories include: {available_dirs}"
-        )
+    if missing_class_dirs and not resolved_class_dirs:
+        if not label_map:
+            available_dirs = [str(path) for path in sorted(path for path in input_root.rglob("*") if path.is_dir())[:50]]
+            raise FileNotFoundError(
+                "Could not resolve the expected class folders under "
+                f"{input_root}: {missing_class_dirs}. Available directories include: {available_dirs}. "
+                "This input looks like a raw ADNI subject tree, so a labels CSV is required."
+            )
+
+        log.info("No class folders were found; switching to raw ADNI subject-tree mode")
+        raw_groups: Dict[str, List[Path]] = defaultdict(list)
+        raw_subject_roots: Dict[str, Path] = {}
+
+        for image_path in _collect_images(input_root):
+            subject_id = _extract_subject_id_from_path(image_path)
+            raw_groups[subject_id].append(image_path)
+            raw_subject_roots.setdefault(subject_id, _find_subject_root_from_path(image_path, input_root))
+
+        if not raw_groups:
+            raise FileNotFoundError(f"No image files were found under {input_root}")
+
+        rows.clear()
+        class_summary.clear()
+        total_images = 0
+        total_subjects = 0
+
+        for subject_index, subject_id in enumerate(sorted(raw_groups), start=1):
+            subject_images = sorted(raw_groups[subject_id])
+            if not subject_images:
+                continue
+
+            if subject_id not in label_map:
+                raise FileNotFoundError(
+                    f"Missing label for subject_id={subject_id!r} in {labels_csv if labels_csv else 'labels CSV'}"
+                )
+
+            label = int(label_map[subject_id])
+            class_name = _class_name_for_label(label)
+            subject_root = raw_subject_roots.get(subject_id, input_root)
+            prepared_subject_dir = output_root / class_name / subject_id
+            prepared_subject_dir.mkdir(parents=True, exist_ok=True)
+
+            _copy_subject_images(subject_images, subject_root, prepared_subject_dir, transfer_mode)
+
+            image_count = len(subject_images)
+            total_images += image_count
+            total_subjects += 1
+
+            if total_subjects == 1 or total_subjects % 25 == 0:
+                log.info(
+                    f"Prepared {total_subjects} raw ADNI subjects so far | subject='{subject_id}' | "
+                    f"label={label} ({class_name}) | images={image_count}"
+                )
+
+            rows.append(
+                {
+                    "subject_id": subject_id,
+                    "class_name": class_name,
+                    "label": label,
+                    "image_count": image_count,
+                    "source_folder": str(subject_root),
+                    "smri_path": str(prepared_subject_dir.relative_to(output_root)),
+                    "prepared_folder": str(prepared_subject_dir.relative_to(output_root)),
+                }
+            )
+
+        for class_name, label in DEFAULT_CLASS_LABELS:
+            class_subjects = [row for row in rows if row["class_name"] == class_name]
+            class_summary[class_name] = {
+                "label": label,
+                "subjects": len(class_subjects),
+                "images": sum(int(row["image_count"]) for row in class_subjects),
+            }
+
+        missing_class_dirs = []
 
     labels_csv = output_root / "labels.csv"
     with labels_csv.open("w", newline="", encoding="utf-8") as csv_file:
@@ -308,6 +495,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional zip output path. Defaults to <output-root>.zip when --create-zip is set.",
     )
+    parser.add_argument(
+        "--labels-csv",
+        type=Path,
+        default=None,
+        help="Optional labels CSV for raw ADNI trees when class folders are not present.",
+    )
     return parser.parse_args()
 
 
@@ -316,7 +509,13 @@ def main() -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="[%(asctime)s - %(levelname)s] %(message)s")
 
-    summary = build_dataset(args.input_root, args.output_root, args.transfer_mode, args.overwrite)
+    summary = build_dataset(
+        args.input_root,
+        args.output_root,
+        args.transfer_mode,
+        args.overwrite,
+        labels_csv=args.labels_csv,
+    )
 
     logger.info(json.dumps(summary, indent=2))
 
