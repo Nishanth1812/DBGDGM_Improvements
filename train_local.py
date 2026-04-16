@@ -281,6 +281,10 @@ def build_output_dir(base_output_dir: Optional[Path]) -> Path:
     return Path("local_results") / datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _default_raw_work_dir() -> Path:
+    return ROOT_DIR / ".cache" / "raw_inputs"
+
+
 def _source_signature(path: Path) -> Dict[str, Any]:
     stat_result = path.stat()
     return {
@@ -569,7 +573,7 @@ def main() -> Dict[str, Any]:
 
         dicom_bundle_zip = _require_existing_zip_path(args.dicom_bundle_zip, path_base_dir, "dicom_bundle_zip")
         smri_zip = _require_existing_zip_path(args.smri_zip, path_base_dir, "smri_zip")
-        work_dir = _resolve_optional_path(args.work_dir, path_base_dir) or (output_dir / "raw_inputs")
+        work_dir = _resolve_optional_path(args.work_dir, path_base_dir) or _default_raw_work_dir()
 
         logger.info(f"Raw zip mode enabled")
         logger.info(f"DICOM bundle zip: {dicom_bundle_zip}")
