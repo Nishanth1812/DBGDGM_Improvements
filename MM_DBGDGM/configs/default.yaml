@@ -10,6 +10,7 @@ data:
   smri_source_root: ''  # Optional local prepared SMRI JPG root; supports prepared_folder / smri_path columns
   fmri_path_column: 'fmri_path'  # Optional explicit path column in the manifest
   smri_path_column: 'smri_path'  # Optional explicit path column in the manifest
+  allow_unaligned_pairing: false  # POC mode: pair each sMRI row to a deterministic available fMRI source when IDs do not align
   max_dicoms_per_series: 120  # Cap raw DICOM decoding per series when using extracted bundles
   normalize: true  # Normalize inputs
   val_fraction: 0.1  # Used when metadata_file is set

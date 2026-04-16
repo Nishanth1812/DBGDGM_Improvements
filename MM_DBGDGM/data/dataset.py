@@ -10,6 +10,7 @@ standalone GPU machine without the Modal preprocessing cache.
 import logging
 import os
 import re
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -478,6 +479,7 @@ class MultimodalBrainDataset(Dataset):
         metadata_base_dir: Optional[str] = None,
         drop_incomplete_samples: bool = True,
         strict_missing_modalities: bool = False,
+        allow_unaligned_pairing: bool = False,
         verbose: bool = False
     ):
         """
@@ -498,6 +500,7 @@ class MultimodalBrainDataset(Dataset):
             metadata_base_dir: Base directory used to resolve relative metadata paths
             drop_incomplete_samples: Drop metadata rows that cannot resolve required modality sources
             strict_missing_modalities: Raise errors for missing modalities at __getitem__ time
+            allow_unaligned_pairing: Allow deterministic fallback pairing to any available fMRI source
             verbose: Print loading information
         """
         self.dataset_root = Path(dataset_root)
@@ -517,14 +520,27 @@ class MultimodalBrainDataset(Dataset):
         self.smri_path_column = smri_path_column
         self.drop_incomplete_samples = bool(drop_incomplete_samples)
         self.strict_missing_modalities = bool(strict_missing_modalities)
+        self.allow_unaligned_pairing = bool(allow_unaligned_pairing)
         self.verbose = verbose
         
         # Load metadata
         self.samples = self._normalize_samples(samples) if samples is not None else self._load_metadata()
         self._dicom_series_index: Dict[str, List[Path]] = {}
         self._dicom_series_index_canonical: Dict[str, List[Path]] = {}
+        self._global_fmri_pool: List[Path] = []
         if not (self.dataset_root / 'fmri').exists():
             self._dicom_series_index = self._build_dicom_series_index()
+
+        self._global_fmri_pool = self._build_global_fmri_pool()
+
+        if self.allow_unaligned_pairing and not self._global_fmri_pool and 'fmri' in self.modalities:
+            logger.warning(
+                "allow_unaligned_pairing=True but no global fMRI fallback pool could be built; "
+                "subject-level fMRI matching remains required"
+            )
+
+        if self.allow_unaligned_pairing and self.verbose and self._global_fmri_pool:
+            logger.info(f"Unaligned pairing enabled | global fMRI fallback pool size={len(self._global_fmri_pool)}")
 
         if self.drop_incomplete_samples and len(self.modalities) > 1:
             self._filter_incomplete_samples()
@@ -610,6 +626,34 @@ class MultimodalBrainDataset(Dataset):
             logger.info(f"Indexed {sum(len(paths) for paths in dicom_index.values())} raw DICOM series for fallback lookup")
 
         return dicom_index
+
+    def _build_global_fmri_pool(self) -> List[Path]:
+        pool: List[Path] = []
+
+        fmri_root = self.dataset_root / 'fmri'
+        if fmri_root.exists():
+            pool.extend(sorted(fmri_root.rglob('fmri_windows_dbgdgm.npy')))
+            pool.extend(sorted(fmri_root.rglob('fmri.npy')))
+
+            # If no arrays exist, keep directories as potential raw-DICOM sources.
+            if not pool:
+                for series_dir in sorted({path.parent for path in fmri_root.rglob('*') if path.is_file() and _is_dicom_file(path)}):
+                    pool.append(series_dir)
+
+        if not pool and self._dicom_series_index:
+            for candidate_dirs in self._dicom_series_index.values():
+                pool.extend(candidate_dirs)
+
+        deduped = sorted(set(pool), key=lambda path: str(path).lower())
+        return deduped
+
+    def _pick_unaligned_fmri_source(self, subject_id: str, timepoint: str) -> Optional[Path]:
+        if not self.allow_unaligned_pairing or not self._global_fmri_pool:
+            return None
+
+        stable_key = f"{subject_id}|{timepoint}".encode('utf-8')
+        stable_index = int(hashlib.md5(stable_key).hexdigest(), 16) % len(self._global_fmri_pool)
+        return self._global_fmri_pool[stable_index]
     
     def _load_metadata(self) -> List[Dict]:
         """Load sample information from metadata file."""
@@ -705,6 +749,10 @@ class MultimodalBrainDataset(Dataset):
         canonical_candidates = self._dicom_series_index_canonical.get(canonical_subject, [])
         if canonical_candidates:
             return canonical_candidates[0]
+
+        unaligned_source = self._pick_unaligned_fmri_source(subject_id, timepoint)
+        if unaligned_source is not None:
+            return unaligned_source
 
         return None
 
@@ -998,7 +1046,8 @@ def create_dataloaders(
     max_dicoms_per_series: int = 120,
     smri_source_root: Optional[str] = None,
     fmri_path_column: str = 'fmri_path',
-    smri_path_column: str = 'smri_path'
+    smri_path_column: str = 'smri_path',
+    allow_unaligned_pairing: bool = False,
 ) -> Dict[str, DataLoader]:
     """
     Create dataloaders for train, val, and optionally test sets.
@@ -1023,6 +1072,7 @@ def create_dataloaders(
         smri_source_root: Optional local prepared SMRI JPG root
         fmri_path_column: Optional metadata column for explicit fMRI paths
         smri_path_column: Optional metadata column for explicit sMRI paths
+        allow_unaligned_pairing: Deterministically pair to available fMRI sources when IDs do not align
     
     Returns:
         dict with 'train', 'val', and optionally 'test' dataloaders
@@ -1046,6 +1096,7 @@ def create_dataloaders(
         'smri_source_root': smri_source_root,
         'fmri_path_column': fmri_path_column,
         'smri_path_column': smri_path_column,
+        'allow_unaligned_pairing': allow_unaligned_pairing,
         'verbose': True,
     }
 

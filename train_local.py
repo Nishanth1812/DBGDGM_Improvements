@@ -536,6 +536,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-metadata", type=Path, default=None)
     parser.add_argument("--test-metadata", type=Path, default=None)
     parser.add_argument("--smri-source-root", type=Path, default=None)
+    parser.add_argument("--allow-unaligned-pairing", action="store_true")
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--pretrained-fmri-checkpoint", type=Path, default=None)
     parser.add_argument("--freeze-fmri-encoder", action="store_true")
@@ -648,6 +649,7 @@ def main() -> Dict[str, Any]:
     normalize = bool(data_cfg.get("normalize", True))
     fmri_path_column = str(data_cfg.get("fmri_path_column", "fmri_path"))
     smri_path_column = str(data_cfg.get("smri_path_column", "smri_path"))
+    allow_unaligned_pairing = bool(_coalesce(args.allow_unaligned_pairing, data_cfg.get("allow_unaligned_pairing"), default=False))
     max_dicoms_per_series = int(_coalesce(data_cfg.get("max_dicoms_per_series"), default=120))
 
     if raw_zip_mode:
@@ -666,6 +668,7 @@ def main() -> Dict[str, Any]:
     logger.info(f"Test metadata: {test_metadata if test_metadata is not None else '<none>'}")
     logger.info(f"SMRI source root: {smri_source_root if smri_source_root is not None else '<none>'}")
     logger.info(f"fMRI path column: {fmri_path_column} | sMRI path column: {smri_path_column}")
+    logger.info(f"Allow unaligned pairing: {allow_unaligned_pairing}")
     logger.info(f"Max DICOM slices per series: {max_dicoms_per_series}")
     logger.info(f"Batch size: {batch_size} | Workers: {num_workers} | Epochs: {num_epochs}")
     logger.info(f"Learning rate: {learning_rate} | Weight decay: {weight_decay}")
@@ -761,6 +764,7 @@ def main() -> Dict[str, Any]:
         smri_source_root=str(smri_source_root) if smri_source_root is not None else None,
         fmri_path_column=fmri_path_column,
         smri_path_column=smri_path_column,
+        allow_unaligned_pairing=allow_unaligned_pairing,
     )
 
     train_loader = dataloaders["train"]
@@ -807,6 +811,7 @@ def main() -> Dict[str, Any]:
                 smri_source_root=str(smri_source_root) if smri_source_root is not None else None,
                 fmri_path_column=fmri_path_column,
                 smri_path_column=smri_path_column,
+                allow_unaligned_pairing=allow_unaligned_pairing,
             )
             train_loader = dataloaders["train"]
             val_loader = dataloaders["val"]
