@@ -135,6 +135,8 @@ def _build_samples_from_prepared_root(
         subject_id = _extract_subject_id(series_dir)
         label = label_map.get(subject_id)
         if label is None:
+            label = label_map.get(_canonical_subject_key(subject_id))
+        if label is None:
             label = _class_label_from_path(series_dir)
         if label is None:
             label = int(subject_id[-1]) % num_classes if subject_id else 0

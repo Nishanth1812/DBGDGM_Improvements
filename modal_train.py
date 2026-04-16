@@ -238,6 +238,10 @@ def _extract_subject_id(series_dir: Path) -> str:
     return folder_name or series_dir.parent.name
 
 
+def _canonical_subject_key(value: Any) -> str:
+    return "".join(ch for ch in str(value).strip().casefold() if ch.isalnum())
+
+
 def _deterministic_label(subject_id: str, num_classes: int) -> int:
     """Fallback label assignment when diagnosis labels are unavailable."""
     digest = hashlib.md5(subject_id.encode("utf-8")).hexdigest()
@@ -292,6 +296,9 @@ def _load_optional_label_map(
             except Exception:
                 label_value = stage_map.get(str(raw_label).strip().upper(), 0)
             label_map[subject] = label_value
+            canonical_subject = _canonical_subject_key(subject)
+            if canonical_subject and canonical_subject not in label_map:
+                label_map[canonical_subject] = label_value
 
         logger.info(f"Loaded {len(label_map)} labels from {label_file}")
         return label_map
@@ -1351,7 +1358,11 @@ def _prepare_real_dataloaders_from_drive(
     work_items: List[Tuple[Path, int, Path]] = []
     for series_dir in series_dirs:
         subject_id = _extract_subject_id(series_dir)
-        label = label_map.get(subject_id, _deterministic_label(subject_id, num_classes))
+        label = label_map.get(subject_id)
+        if label is None:
+            label = label_map.get(_canonical_subject_key(subject_id))
+        if label is None:
+            label = _deterministic_label(subject_id, num_classes)
         label = int(np.clip(label, 0, num_classes - 1))
         series_sample_cache_path = _compute_series_sample_cache_path(
             series_dir=series_dir,

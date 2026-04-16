@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import logging
 import json
 import os
@@ -73,6 +74,7 @@ DEFAULT_CLASS_LABELS: List[Tuple[str, int]] = [
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 DICOM_EXTENSIONS = {".dcm", ".dicom", ".ima", ""}
 logger = logging.getLogger("smri-prep")
+SOURCE_MARKER_FILENAME = ".source.json"
 
 
 def _normalize_folder_name(name: str) -> str:
@@ -81,6 +83,46 @@ def _normalize_folder_name(name: str) -> str:
 
 def _canonical_subject_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().casefold())
+
+
+def _path_signature(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None or not path.exists():
+        return None
+
+    stat_result = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+        "size": int(stat_result.st_size),
+    }
+
+
+def _build_source_marker(input_root: Path, labels_csv: Optional[Path]) -> Dict[str, Any]:
+    return {
+        "input_root": str(input_root.resolve()),
+        "input_root_signature": _path_signature(input_root),
+        "labels_csv_signature": _path_signature(labels_csv),
+    }
+
+
+def _load_source_marker(output_root: Path) -> Optional[Dict[str, Any]]:
+    marker_path = output_root / SOURCE_MARKER_FILENAME
+    if not marker_path.exists():
+        return None
+
+    try:
+        return json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _source_marker_matches(output_root: Path, input_root: Path, labels_csv: Optional[Path]) -> bool:
+    marker = _load_source_marker(output_root)
+    if not marker:
+        return False
+
+    expected = _build_source_marker(input_root, labels_csv)
+    return marker == expected
 
 
 def _is_dicom_file(file_path: Path) -> bool:
@@ -388,6 +430,18 @@ def build_dataset(
     if not input_root.exists():
         raise FileNotFoundError(f"Input root not found: {input_root}")
 
+    if output_root.exists() and _source_marker_matches(output_root, input_root, labels_csv):
+        summary_path = output_root / "dataset_summary.json"
+        labels_csv_path = output_root / "labels.csv"
+        if summary_path.exists() and labels_csv_path.exists():
+            log.info(
+                f"Reusing prepared SMRI dataset at {output_root} for input_root={input_root}"
+            )
+            try:
+                return json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                log.warning("Prepared dataset summary could not be read; rebuilding dataset")
+
     log.info(
         f"Preparing SMRI dataset | input_root={input_root} | output_root={output_root} | "
         f"transfer_mode={transfer_mode} | overwrite={overwrite} | labels_csv={labels_csv if labels_csv else '<none>'}"
@@ -582,6 +636,8 @@ def build_dataset(
     }
     summary_path = output_root / "dataset_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    marker_path = output_root / SOURCE_MARKER_FILENAME
+    marker_path.write_text(json.dumps(_build_source_marker(input_root, labels_csv), indent=2), encoding="utf-8")
 
     log.info(
         f"SMRI dataset prepared | total_subjects={total_subjects} | total_images={total_images} | "

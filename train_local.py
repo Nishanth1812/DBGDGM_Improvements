@@ -281,7 +281,55 @@ def build_output_dir(base_output_dir: Optional[Path]) -> Path:
     return Path("local_results") / datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _source_signature(path: Path) -> Dict[str, Any]:
+    stat_result = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+        "size": int(stat_result.st_size),
+    }
+
+
+def _marker_path(target_dir: Path) -> Path:
+    return target_dir / ".source.json"
+
+
+def _load_marker(target_dir: Path) -> Optional[Dict[str, Any]]:
+    marker_file = _marker_path(target_dir)
+    if not marker_file.exists():
+        return None
+
+    try:
+        return json.loads(marker_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_marker(target_dir: Path, payload: Dict[str, Any]) -> None:
+    _marker_path(target_dir).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _archive_reuse_matches(zip_path: Path, target_dir: Path) -> bool:
+    marker = _load_marker(target_dir)
+    if not marker:
+        return False
+    expected = {
+        "kind": "zip_archive",
+        "source": _source_signature(zip_path),
+    }
+    return marker == expected
+
+
 def _extract_zip_archive(zip_path: Path, target_dir: Path, logger: logging.Logger) -> None:
+    expected_marker = {
+        "kind": "zip_archive",
+        "source": _source_signature(zip_path),
+    }
+
+    if target_dir.exists() and _archive_reuse_matches(zip_path, target_dir):
+        logger.info(f"Reusing previously extracted archive: {zip_path.name} -> {target_dir}")
+        return
+
     if target_dir.exists():
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +358,7 @@ def _extract_zip_archive(zip_path: Path, target_dir: Path, logger: logging.Logge
                     f"Extracted {zip_path.name}: {member_index}/{total_members} files ({percent:.1f}%)"
                 )
 
+    _write_marker(target_dir, expected_marker)
     logger.info(f"Finished extracting {zip_path.name} to {target_dir}")
 
 
@@ -351,6 +400,20 @@ def _find_any_labels_csv(*roots: Path) -> Optional[Path]:
         if labels_csv is not None:
             return labels_csv
     return None
+
+
+def _prepared_smri_reuse_matches(prepared_smri_root: Path, raw_smri_root: Path, labels_csv: Optional[Path]) -> bool:
+    marker = _load_marker(prepared_smri_root)
+    if not marker:
+        return False
+
+    expected = {
+        "kind": "prepared_smri_dataset",
+        "source_root": str(raw_smri_root.resolve()),
+        "source_root_signature": _source_signature(raw_smri_root),
+        "labels_csv_signature": _source_signature(labels_csv) if labels_csv is not None and labels_csv.exists() else None,
+    }
+    return marker == expected
 
 
 def _has_dicom_files(root_dir: Path) -> bool:
@@ -418,16 +481,19 @@ def _prepare_raw_zip_inputs(
             )
         else:
             logger.info(f"Using labels CSV for raw SMRI preparation: {labels_csv}")
-        logger.info(f"Rebuilding prepared SMRI dataset from raw folders: {raw_smri_root}")
         prepared_smri_root = work_dir / "prepared_smri_dataset"
-        build_smri_dataset(
-            input_root=raw_smri_root,
-            output_root=prepared_smri_root,
-            transfer_mode="hardlink",
-            overwrite=True,
-            labels_csv=labels_csv,
-            logger=logger,
-        )
+        if prepared_smri_root.exists() and _prepared_smri_reuse_matches(prepared_smri_root, raw_smri_root, labels_csv):
+            logger.info(f"Reusing prepared SMRI dataset at {prepared_smri_root}")
+        else:
+            logger.info(f"Rebuilding prepared SMRI dataset from raw folders: {raw_smri_root}")
+            build_smri_dataset(
+                input_root=raw_smri_root,
+                output_root=prepared_smri_root,
+                transfer_mode="hardlink",
+                overwrite=True,
+                labels_csv=labels_csv,
+                logger=logger,
+            )
 
     labels_csv = prepared_smri_root / "labels.csv"
     if not labels_csv.exists():
