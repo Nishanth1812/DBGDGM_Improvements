@@ -99,21 +99,30 @@ class Trainer:
 
     def _prepare_batch(self, batch):
         """Move a batch to the target device and build target dictionaries."""
-        fmri = batch['fmri'].to(self.device)
-        smri = batch['smri'].to(self.device)
-        targets = batch['label'].to(self.device)
+        fmri = batch['fmri'].to(self.device, non_blocking=True)
+        smri = batch['smri'].to(self.device, non_blocking=True)
+        targets = batch['label'].to(self.device, non_blocking=True)
 
         regression_targets = {
-            'hippocampal_volume': batch['hippo_vol'].to(self.device),
-            'cortical_thinning_rate': batch['cortical_thinning'].to(self.device),
-            'dmn_connectivity': batch['dmn_conn'].to(self.device),
-            'nss': batch['nss'].to(self.device)
+            'hippocampal_volume': batch['hippo_vol'].to(self.device, non_blocking=True),
+            'cortical_thinning_rate': batch['cortical_thinning'].to(self.device, non_blocking=True),
+            'dmn_connectivity': batch['dmn_conn'].to(self.device, non_blocking=True),
+            'nss': batch['nss'].to(self.device, non_blocking=True)
         }
 
-        survival_times = batch['survival_times'].to(self.device)
-        survival_events = batch['survival_events'].to(self.device)
+        survival_times = batch['survival_times'].to(self.device, non_blocking=True)
+        survival_events = batch['survival_events'].to(self.device, non_blocking=True)
 
         return fmri, smri, targets, regression_targets, survival_times, survival_events
+
+    def _metrics_to_float_dict(self, metrics: Dict[str, Any]) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        for key, value in metrics.items():
+            if torch.is_tensor(value):
+                result[key] = float(value.detach().cpu().item())
+            else:
+                result[key] = float(value)
+        return result
 
     def _compute_loss_dict(
         self,
@@ -294,7 +303,7 @@ class Trainer:
             total_loss = loss_dict['total']
             
             # Backward pass
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -304,12 +313,12 @@ class Trainer:
             with torch.no_grad():
                 for key in loss_dict:
                     if isinstance(loss_dict[key], torch.Tensor):
-                        metrics[f'train_{key}'] += loss_dict[key].item()
+                        metrics[f'train_{key}'] += loss_dict[key].detach()
                 
                 # Accuracy
                 preds = outputs['predictions']
                 acc = (preds == targets).float().mean()
-                metrics['train_accuracy'] += acc.item()
+                metrics['train_accuracy'] += acc.detach()
             
             num_batches += 1
             
@@ -333,7 +342,7 @@ class Trainer:
 
         logger.info(f"Epoch {epoch_number}: training finished")
         
-        return dict(metrics)
+        return self._metrics_to_float_dict(dict(metrics))
     
     @torch.no_grad()
     def validate(
@@ -408,12 +417,12 @@ class Trainer:
             # Accumulate metrics
             for key in loss_dict:
                 if isinstance(loss_dict[key], torch.Tensor):
-                    metrics[f'val_{key}'] += loss_dict[key].item()
+                    metrics[f'val_{key}'] += loss_dict[key].detach()
             
             # Accuracy
             preds = outputs['predictions']
             acc = (preds == targets).float().mean()
-            metrics['val_accuracy'] += acc.item()
+            metrics['val_accuracy'] += acc.detach()
 
             if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
                 logger.info(
@@ -438,7 +447,7 @@ class Trainer:
 
         logger.info(f"Epoch {epoch_number}: validation finished")
         
-        return dict(metrics)
+        return self._metrics_to_float_dict(dict(metrics))
 
     @torch.no_grad()
     def test(
@@ -512,12 +521,12 @@ class Trainer:
 
             for key, value in loss_dict.items():
                 if isinstance(value, torch.Tensor):
-                    metrics[f'test_{key}'] += value.item()
+                    metrics[f'test_{key}'] += value.detach()
 
             preds = outputs['predictions']
             probabilities = torch.softmax(outputs['logits'], dim=1)
             acc = (preds == targets).float().mean()
-            metrics['test_accuracy'] += acc.item()
+            metrics['test_accuracy'] += acc.detach()
 
             if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
                 logger.info(
@@ -559,7 +568,7 @@ class Trainer:
             per_class_accuracy[class_name] = float(confusion[class_index, class_index] / row_total) if row_total > 0 else 0.0
 
         results: Dict[str, Any] = {
-            **metrics,
+            **self._metrics_to_float_dict(dict(metrics)),
             'overall_accuracy': float(accuracy_score(y_true, y_pred)),
             'macro_f1': float(f1_score(y_true, y_pred, average='macro', zero_division=0)),
             'weighted_f1': float(f1_score(y_true, y_pred, average='weighted', zero_division=0)),
@@ -670,6 +679,11 @@ class Trainer:
                 else:
                     beta = min(1.0, epoch / annealing_epochs)
 
+                logger.info(
+                    f"Epoch {epoch + 1}/{num_epochs} starting | beta={beta:.4f} | "
+                    f"best_val_loss={self.best_val_loss:.4f} | best_val_acc={self.best_val_acc:.4f}"
+                )
+
                 self._set_progress(
                     phase='epoch',
                     epoch=epoch + 1,
@@ -698,6 +712,8 @@ class Trainer:
                 # Learning rate scheduling
                 scheduler.step()
 
+                current_lr = scheduler.get_last_lr()[0] if scheduler.get_last_lr() else learning_rate
+
                 # Log epoch results
                 logger.info(
                     f"Epoch {epoch + 1}/{num_epochs} | "
@@ -705,7 +721,8 @@ class Trainer:
                     f"Train Acc: {train_metrics['train_accuracy']:.4f} | "
                     f"Val Loss: {val_metrics['val_total']:.4f}, "
                     f"Val Acc: {val_metrics['val_accuracy']:.4f} | "
-                    f"β: {beta:.4f} | Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
+                    f"β: {beta:.4f} | lr: {current_lr:.6g} | "
+                    f"Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
                 )
 
                 # Store history
@@ -717,6 +734,7 @@ class Trainer:
                 val_acc = val_metrics['val_accuracy']
 
                 if val_loss < self.best_val_loss:
+                    logger.info(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}; saving checkpoints")
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
                     self._save_checkpoint(epoch, optimizer, 'best_loss')
@@ -730,6 +748,7 @@ class Trainer:
                     self.patience_counter += 1
 
                 if val_acc > self.best_val_acc:
+                    logger.info(f"Validation accuracy improved from {self.best_val_acc:.4f} to {val_acc:.4f}; saving accuracy checkpoint")
                     self.best_val_acc = val_acc
                     self._save_checkpoint(epoch, optimizer, 'best_acc')
                     logger.info(f"✓ New best validation accuracy: {val_acc:.4f}")
@@ -741,6 +760,7 @@ class Trainer:
 
                 # Save regular checkpoint
                 if (epoch + 1) % 5 == 0:
+                    logger.info(f"Saving periodic checkpoint for epoch {epoch + 1}")
                     self._save_checkpoint(epoch, optimizer, f'epoch_{epoch}')
 
             logger.info("Training completed!")

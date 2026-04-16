@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import json
 import os
 import re
@@ -48,6 +49,7 @@ DEFAULT_CLASS_LABELS: List[Tuple[str, int]] = [
 ]
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+logger = logging.getLogger("smri-prep")
 
 
 def _normalize_folder_name(name: str) -> str:
@@ -146,9 +148,22 @@ def _zip_directory(source_dir: Path, zip_path: Path) -> None:
                 zip_file.write(file_path, file_path.relative_to(source_dir))
 
 
-def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overwrite: bool) -> Dict[str, object]:
+def build_dataset(
+    input_root: Path,
+    output_root: Path,
+    transfer_mode: str,
+    overwrite: bool,
+    logger: logging.Logger | None = None,
+) -> Dict[str, object]:
+    log = logger or logging.getLogger("smri-prep")
+
     if not input_root.exists():
         raise FileNotFoundError(f"Input root not found: {input_root}")
+
+    log.info(
+        f"Preparing SMRI dataset | input_root={input_root} | output_root={output_root} | "
+        f"transfer_mode={transfer_mode} | overwrite={overwrite}"
+    )
 
     class_labels = dict(DEFAULT_CLASS_LABELS)
     if output_root.exists():
@@ -168,13 +183,23 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
     for class_name, label in DEFAULT_CLASS_LABELS:
         class_dir = _resolve_class_dir(input_root, class_name)
         if class_dir is None:
+            log.warning(f"Could not resolve class folder for '{class_name}' under {input_root}")
             missing_class_dirs.append(class_name)
             continue
 
+        log.info(f"Scanning class '{class_name}' from {class_dir}")
+
         grouped_images: Dict[str, List[Path]] = defaultdict(list)
-        for image_path in _collect_images(class_dir):
+        class_images = _collect_images(class_dir)
+        log.info(f"Found {len(class_images)} image files under {class_dir}")
+
+        for image_index, image_path in enumerate(class_images, start=1):
             subject_id = _infer_subject_id(image_path)
             grouped_images[subject_id].append(image_path)
+            if image_index == 1 or image_index == len(class_images) or image_index % 500 == 0:
+                log.info(
+                    f"Class '{class_name}': indexed {image_index}/{len(class_images)} images -> {len(grouped_images)} subjects"
+                )
 
         prepared_class_dir = output_root / class_name
         prepared_class_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +221,12 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
             total_images += image_count
             total_subjects += 1
 
+            if total_subjects == 1 or total_subjects % 50 == 0:
+                log.info(
+                    f"Prepared {total_subjects} subjects so far | current class='{class_name}' | "
+                    f"subject='{subject_id}' | images={image_count}"
+                )
+
             rows.append(
                 {
                     "subject_id": subject_id,
@@ -213,6 +244,10 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
             "subjects": len(grouped_images),
             "images": class_image_count,
         }
+
+        log.info(
+            f"Finished class '{class_name}' | subjects={len(grouped_images)} | images={class_image_count}"
+        )
 
     if missing_class_dirs:
         available_dirs = [str(path) for path in sorted(path for path in input_root.rglob("*") if path.is_dir())[:50]]
@@ -241,6 +276,11 @@ def build_dataset(input_root: Path, output_root: Path, transfer_mode: str, overw
     }
     summary_path = output_root / "dataset_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    log.info(
+        f"SMRI dataset prepared | total_subjects={total_subjects} | total_images={total_images} | "
+        f"labels_csv={labels_csv} | summary={summary_path}"
+    )
 
     return summary
 
@@ -273,14 +313,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="[%(asctime)s - %(levelname)s] %(message)s")
+
     summary = build_dataset(args.input_root, args.output_root, args.transfer_mode, args.overwrite)
 
-    print(json.dumps(summary, indent=2))
+    logger.info(json.dumps(summary, indent=2))
 
     if args.create_zip:
         zip_path = args.zip_path or args.output_root.with_suffix(".zip")
         _zip_directory(args.output_root, zip_path)
-        print(json.dumps({"zip_path": str(zip_path)}, indent=2))
+        logger.info(json.dumps({"zip_path": str(zip_path)}, indent=2))
 
 
 if __name__ == "__main__":

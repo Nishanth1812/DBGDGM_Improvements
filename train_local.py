@@ -281,13 +281,36 @@ def build_output_dir(base_output_dir: Optional[Path]) -> Path:
     return Path("local_results") / datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def _extract_zip_archive(zip_path: Path, target_dir: Path) -> None:
+def _extract_zip_archive(zip_path: Path, target_dir: Path, logger: logging.Logger) -> None:
     if target_dir.exists():
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    zip_size_mb = zip_path.stat().st_size / 1_000_000.0
     with zipfile.ZipFile(zip_path, "r") as zip_file:
-        zip_file.extractall(target_dir)
+        members = [member for member in zip_file.infolist() if not member.is_dir()]
+        total_members = len(members)
+        total_uncompressed_mb = sum(member.file_size for member in members) / 1_000_000.0
+
+        logger.info(
+            f"Extracting {zip_path.name}: {total_members} files, "
+            f"{zip_size_mb:.1f} MB compressed, {total_uncompressed_mb:.1f} MB uncompressed -> {target_dir}"
+        )
+
+        if total_members == 0:
+            logger.info(f"Archive {zip_path.name} contains no extractable files")
+            return
+
+        progress_interval = max(1, total_members // 20)
+        for member_index, member in enumerate(members, start=1):
+            zip_file.extract(member, target_dir)
+            if member_index == 1 or member_index == total_members or member_index % progress_interval == 0:
+                percent = (member_index / total_members) * 100.0
+                logger.info(
+                    f"Extracted {zip_path.name}: {member_index}/{total_members} files ({percent:.1f}%)"
+                )
+
+    logger.info(f"Finished extracting {zip_path.name} to {target_dir}")
 
 
 def _require_existing_zip_path(raw_value: Any, base_dir: Path, label: str) -> Path:
@@ -345,6 +368,8 @@ def _prepare_raw_zip_inputs(
     extract_root = work_dir / "extracted_inputs"
     extract_root.mkdir(parents=True, exist_ok=True)
 
+    logger.info(f"Preparing raw ZIP inputs under {work_dir}")
+
     dicom_extract_root = extract_root / "dicom_bundle"
     smri_extract_root = extract_root / "smri_bundle"
 
@@ -356,7 +381,7 @@ def _prepare_raw_zip_inputs(
 
     logger.info(f"Extracting {len(extract_jobs)} zip file(s) in parallel")
     with ThreadPoolExecutor(max_workers=min(2, len(extract_jobs))) as executor:
-        futures = [executor.submit(_extract_zip_archive, zip_path, target_dir) for zip_path, target_dir in extract_jobs]
+        futures = [executor.submit(_extract_zip_archive, zip_path, target_dir, logger) for zip_path, target_dir in extract_jobs]
         for future in futures:
             future.result()
 
@@ -385,6 +410,7 @@ def _prepare_raw_zip_inputs(
             output_root=prepared_smri_root,
             transfer_mode="hardlink",
             overwrite=True,
+            logger=logger,
         )
 
     labels_csv = prepared_smri_root / "labels.csv"
@@ -526,7 +552,8 @@ def main() -> Dict[str, Any]:
     max_dicoms_per_series = int(_coalesce(data_cfg.get("max_dicoms_per_series"), default=120))
 
     if raw_zip_mode:
-        num_workers = max(num_workers, min(20, os.cpu_count() or 20))
+        cpu_count = os.cpu_count() or 20
+        num_workers = max(num_workers, min(32, max(8, cpu_count - 2)))
 
     if metadata_file is None and train_metadata is None and val_metadata is None:
         raise ValueError(
@@ -546,7 +573,9 @@ def main() -> Dict[str, Any]:
     logger.info(f"Val fraction: {val_fraction} | Test fraction: {test_fraction}")
     logger.info(f"Batch log interval: every {batch_log_interval} batch(es)")
     logger.info(f"Seed: {seed}")
+    logger.info(f"Max wall-clock budget: {max_wall_time_seconds / 60:.1f} minutes")
 
+    logger.info("Initializing model")
     model = MM_DBGDGM(
         n_roi=int(model_cfg.get("n_roi", 200)),
         seq_len=int(model_cfg.get("seq_len", 50)),
@@ -578,6 +607,7 @@ def main() -> Dict[str, Any]:
             frozen_module_names.append("smri_encoder")
 
     if pretrained_fmri_checkpoint is not None and not resume_checkpoint:
+        logger.info(f"Loading pretrained fMRI encoder from {pretrained_fmri_checkpoint}")
         load_pretrained_fmri_encoder(
             model=model,
             checkpoint_reference=str(pretrained_fmri_checkpoint),
@@ -587,6 +617,7 @@ def main() -> Dict[str, Any]:
             logger=logger,
         )
 
+    logger.info("Building loss function")
     criterion = MM_DBGDGM_Loss(
         num_classes=int(model_cfg.get("num_classes", 4)),
         lambda_kl=float(_coalesce(loss_weights_cfg.get("lambda_kl"), training_cfg.get("lambda_kl"), default=0.1)),
@@ -598,6 +629,7 @@ def main() -> Dict[str, Any]:
         smri_recon_weight=float(_coalesce(recon_weights_cfg.get("smri"), training_cfg.get("smri_recon_weight"), default=1.0)),
     ).to(device)
 
+    logger.info("Creating dataloaders")
     dataloaders = create_dataloaders(
         dataset_root=str(dataset_root),
         train_metadata=str(train_metadata) if train_metadata is not None else None,
@@ -642,6 +674,7 @@ def main() -> Dict[str, Any]:
                 f"Train loader only has {train_batches} batches; reducing batch size from {batch_size} to {adjusted_batch_size} "
                 f"to target at least {min_train_batches} batches per epoch"
             )
+            logger.info("Rebuilding dataloaders with adjusted batch size")
             batch_size = adjusted_batch_size
             dataloaders = create_dataloaders(
                 dataset_root=str(dataset_root),
@@ -677,6 +710,7 @@ def main() -> Dict[str, Any]:
     if test_loader is not None:
         logger.info(f"Test batches: {len(test_loader)}")
 
+    logger.info("Initializing trainer")
     trainer = Trainer(
         model=model,
         criterion=criterion,
@@ -691,6 +725,7 @@ def main() -> Dict[str, Any]:
     if resume_checkpoint is not None:
         resolved_resume_checkpoint = resolve_checkpoint_reference(str(resume_checkpoint), output_dir, path_base_dir)
         logger.info(f"Resuming from checkpoint: {resolved_resume_checkpoint}")
+        logger.info("Loading checkpoint state")
         checkpoint = torch.load(resolved_resume_checkpoint, map_location=device)
 
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -727,8 +762,10 @@ def main() -> Dict[str, Any]:
     final_model_path = output_dir / "final.pt"
     final_history_path = output_dir / "history.json"
     config_snapshot_path = output_dir / "config.yaml"
+    logger.info("Writing final config snapshot")
     config_snapshot_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
+    logger.info("Saving final model checkpoint")
     with final_model_path.open("wb") as final_model_file:
         torch.save(
             {
@@ -745,6 +782,7 @@ def main() -> Dict[str, Any]:
         key: [float(value) if isinstance(value, (float, int)) else value for value in values]
         for key, values in trainer.history.items()
     }
+    logger.info("Saving training history")
     with final_history_path.open("w", encoding="utf-8") as history_file:
         json.dump(history_dict, history_file, indent=2)
 

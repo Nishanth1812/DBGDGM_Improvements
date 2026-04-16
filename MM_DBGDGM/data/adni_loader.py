@@ -85,11 +85,22 @@ def get_adni_dataloaders(batch_size: int = 16, mock_data: bool = True, include_t
     val_dataset = ADNILongitudinalDataset(split='val', mock_data=mock_data)
     test_dataset = ADNILongitudinalDataset(split='test', mock_data=mock_data) if include_test else None
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    loader_kwargs = {
+        'batch_size': batch_size,
+        'pin_memory': torch.cuda.is_available(),
+    }
+    if mock_data:
+        loader_kwargs['num_workers'] = 0
+    else:
+        loader_kwargs['num_workers'] = 4
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = 4
+
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
     
     if include_test:
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
         return train_loader, val_loader, test_loader
 
     return train_loader, val_loader

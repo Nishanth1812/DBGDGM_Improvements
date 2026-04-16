@@ -20,21 +20,21 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, beta_ann
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for batch in pbar:
         # Move inputs to device
-        fmri = batch['fmri'].to(device)
-        smri = batch['smri'].to(device)
-        labels = batch['label'].to(device)
+        fmri = batch['fmri'].to(device, non_blocking=True)
+        smri = batch['smri'].to(device, non_blocking=True)
+        labels = batch['label'].to(device, non_blocking=True)
         
         # Move regression targets
         reg_targets = {
-            'hippocampal_volume': batch['hippo_vol'].to(device),
-            'cortical_thinning_rate': batch['cortical_thinning'].to(device),
-            'dmn_connectivity': batch['dmn_conn'].to(device),
-            'nss': batch['nss'].to(device)
+            'hippocampal_volume': batch['hippo_vol'].to(device, non_blocking=True),
+            'cortical_thinning_rate': batch['cortical_thinning'].to(device, non_blocking=True),
+            'dmn_connectivity': batch['dmn_conn'].to(device, non_blocking=True),
+            'nss': batch['nss'].to(device, non_blocking=True)
         }
         
         # Move survival targets
-        surv_times = batch['survival_times'].to(device)
-        surv_events = batch['survival_events'].to(device)
+        surv_times = batch['survival_times'].to(device, non_blocking=True)
+        surv_events = batch['survival_events'].to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
@@ -86,18 +86,18 @@ def validate(model, dataloader, criterion, device):
     
     with torch.no_grad():
         for batch in dataloader:
-            fmri = batch['fmri'].to(device)
-            smri = batch['smri'].to(device)
-            labels = batch['label'].to(device)
+            fmri = batch['fmri'].to(device, non_blocking=True)
+            smri = batch['smri'].to(device, non_blocking=True)
+            labels = batch['label'].to(device, non_blocking=True)
             
             reg_targets = {
-                'hippocampal_volume': batch['hippo_vol'].to(device),
-                'cortical_thinning_rate': batch['cortical_thinning'].to(device),
-                'dmn_connectivity': batch['dmn_conn'].to(device),
-                'nss': batch['nss'].to(device)
+                'hippocampal_volume': batch['hippo_vol'].to(device, non_blocking=True),
+                'cortical_thinning_rate': batch['cortical_thinning'].to(device, non_blocking=True),
+                'dmn_connectivity': batch['dmn_conn'].to(device, non_blocking=True),
+                'nss': batch['nss'].to(device, non_blocking=True)
             }
-            surv_times = batch['survival_times'].to(device)
-            surv_events = batch['survival_events'].to(device)
+            surv_times = batch['survival_times'].to(device, non_blocking=True)
+            surv_events = batch['survival_events'].to(device, non_blocking=True)
             
             outputs = model(fmri, smri, return_all=True)
             

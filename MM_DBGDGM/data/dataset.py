@@ -8,6 +8,7 @@ standalone GPU machine without the Modal preprocessing cache.
 """
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,6 +46,18 @@ FMRI_CLUE_TOKENS = (
     "ep2d",
     "epi",
 )
+
+
+def _suggest_num_workers(requested_num_workers: int, dataset_root: Path) -> int:
+    cpu_count = os.cpu_count() or 4
+    requested_num_workers = max(0, int(requested_num_workers))
+
+    if (dataset_root / 'fmri').exists():
+        recommended = min(16, max(4, cpu_count // 4))
+    else:
+        recommended = min(32, max(8, max(1, cpu_count - 2)))
+
+    return max(requested_num_workers, recommended)
 
 
 def _is_image_file(file_path: Path) -> bool:
@@ -887,6 +900,13 @@ def create_dataloaders(
         dict with 'train', 'val', and optionally 'test' dataloaders
     """
     
+    dataset_root_path = Path(dataset_root)
+
+    logger.info(
+        f"Creating dataloaders | dataset_root={dataset_root} | batch_size={batch_size} | "
+        f"num_workers={num_workers} | metadata_file={metadata_file if metadata_file else '<none>'}"
+    )
+
     dataset_kwargs = {
         'dataset_root': dataset_root,
         'normalize_fmri': normalize,
@@ -1002,6 +1022,13 @@ def create_dataloaders(
         raise ValueError(
             "Provide either metadata_file for an auto-split manifest or train_metadata/val_metadata CSV files"
         )
+
+    effective_num_workers = _suggest_num_workers(num_workers, dataset_root_path)
+    if effective_num_workers != num_workers:
+        logger.info(
+            f"Tuning DataLoader workers from {num_workers} to {effective_num_workers} for dataset_root={dataset_root_path}"
+        )
+        num_workers = effective_num_workers
     
     loader_kwargs = {
         'batch_size': batch_size,
@@ -1011,7 +1038,7 @@ def create_dataloaders(
         'persistent_workers': bool(num_workers > 0),
     }
     if num_workers > 0:
-        loader_kwargs['prefetch_factor'] = 4
+        loader_kwargs['prefetch_factor'] = 8 if num_workers >= 8 else 4
 
     dataloaders = {
         'train': DataLoader(
@@ -1032,5 +1059,13 @@ def create_dataloaders(
             **loader_kwargs,
             shuffle=False,
         )
+
+    logger.info(
+        f"Dataloaders ready | train_samples={len(train_dataset)} | val_samples={len(val_dataset)} | "
+        f"test_samples={len(test_dataset) if test_dataset is not None else 0} | "
+        f"train_batches={len(dataloaders['train'])} | val_batches={len(dataloaders['val'])} | "
+        f"test_batches={len(dataloaders['test']) if 'test' in dataloaders else 0} | "
+        f"pin_memory={loader_kwargs['pin_memory']} | persistent_workers={loader_kwargs['persistent_workers']}"
+    )
     
     return dataloaders
