@@ -85,6 +85,18 @@ class Trainer:
         if self.frozen_module_names:
             logger.info(f"Frozen modules (eval mode during train): {sorted(self.frozen_module_names)}")
 
+    def _gpu_memory_summary(self) -> str:
+        if self.device.type != 'cuda' or not torch.cuda.is_available():
+            return ''
+
+        try:
+            allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved(self.device) / (1024 ** 3)
+            peak = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+            return f" | GPU mem alloc {allocated:.2f} GB | reserved {reserved:.2f} GB | peak {peak:.2f} GB"
+        except Exception:
+            return ''
+
     def _prepare_batch(self, batch):
         """Move a batch to the target device and build target dictionaries."""
         fmri = batch['fmri'].to(self.device)
@@ -211,7 +223,8 @@ class Trainer:
         train_loader: DataLoader,
         optimizer: torch.optim.Optimizer,
         epoch: int,
-        beta_annealing: float = 1.0
+        beta_annealing: float = 1.0,
+        log_every_n_batches: int = 10,
     ) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -301,11 +314,12 @@ class Trainer:
             num_batches += 1
             
             # Log progress
-            if batch_number == 1 or batch_number == total_batches or batch_number % max(1, total_batches // 4) == 0:
+            if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
                 logger.info(
                     f"Epoch {epoch_number}: batch {batch_number}/{total_batches} done in {step_done - batch_start:.1f}s "
                     f"(prepare {prepare_done - batch_start:.1f}s, forward {forward_done - prepare_done:.1f}s, "
-                    f"backward {step_done - forward_done:.1f}s) | Loss: {total_loss.item():.4f} | Acc: {acc.item():.4f}"
+                    f"backward {step_done - forward_done:.1f}s) | Loss: {total_loss.item():.4f} | Acc: {acc.item():.4f}" \
+                    f"{self._gpu_memory_summary()}"
                 )
 
         if num_batches == 0:
@@ -326,7 +340,8 @@ class Trainer:
         self,
         val_loader: DataLoader,
         epoch: int,
-        beta_annealing: float = 1.0
+        beta_annealing: float = 1.0,
+        log_every_n_batches: int = 10,
     ) -> Dict[str, float]:
         """
         Validate on validation set.
@@ -399,6 +414,13 @@ class Trainer:
             preds = outputs['predictions']
             acc = (preds == targets).float().mean()
             metrics['val_accuracy'] += acc.item()
+
+            if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
+                logger.info(
+                    f"Epoch {epoch_number}: validation batch {batch_number}/{total_batches} | "
+                    f"Loss: {loss_dict['total'].item():.4f} | Acc: {acc.item():.4f}" \
+                    f"{self._gpu_memory_summary()}"
+                )
             
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(targets.cpu().numpy())
@@ -424,7 +446,8 @@ class Trainer:
         test_loader: DataLoader,
         checkpoint_path: Optional[str] = None,
         beta_annealing: float = 1.0,
-        save_name: str = 'test_results.json'
+        save_name: str = 'test_results.json',
+        log_every_n_batches: int = 10,
     ) -> Dict[str, Any]:
         """
         Evaluate the model on a held-out test set and persist the results.
@@ -495,6 +518,12 @@ class Trainer:
             probabilities = torch.softmax(outputs['logits'], dim=1)
             acc = (preds == targets).float().mean()
             metrics['test_accuracy'] += acc.item()
+
+            if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
+                logger.info(
+                    f"Testing batch {batch_number}/{total_batches} | Loss: {loss_dict['total'].item():.4f} | "
+                    f"Acc: {acc.item():.4f}{self._gpu_memory_summary()}"
+                )
 
             all_preds.extend(preds.cpu().tolist())
             all_targets.extend(targets.cpu().tolist())
@@ -569,6 +598,7 @@ class Trainer:
         weight_decay: float = 1e-5,
         patience: int = 10,
         annealing_epochs: int = 20,
+        log_every_n_batches: int = 10,
         start_epoch: int = 0,
         resume_optimizer_state: Optional[Dict] = None,
         max_wall_time_seconds: Optional[float] = None
@@ -649,10 +679,21 @@ class Trainer:
                 )
 
                 # Train
-                train_metrics = self.train_epoch(train_loader, optimizer, epoch, beta_annealing=beta)
+                train_metrics = self.train_epoch(
+                    train_loader,
+                    optimizer,
+                    epoch,
+                    beta_annealing=beta,
+                    log_every_n_batches=log_every_n_batches,
+                )
 
                 # Validate
-                val_metrics = self.validate(val_loader, epoch, beta_annealing=beta)
+                val_metrics = self.validate(
+                    val_loader,
+                    epoch,
+                    beta_annealing=beta,
+                    log_every_n_batches=log_every_n_batches,
+                )
 
                 # Learning rate scheduling
                 scheduler.step()

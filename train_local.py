@@ -29,6 +29,14 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 from MM_DBGDGM.data.dataset import create_dataloaders
 from MM_DBGDGM.models.mm_dbgdgm import MM_DBGDGM
 from MM_DBGDGM.training.losses import MM_DBGDGM_Loss
@@ -505,6 +513,7 @@ def main() -> Dict[str, Any]:
     weight_decay = float(_coalesce(training_cfg.get("weight_decay"), default=1e-5))
     patience = int(_coalesce(training_cfg.get("early_stopping_patience"), training_cfg.get("patience"), default=10))
     annealing_epochs = int(_coalesce(training_cfg.get("kl_annealing_epochs"), training_cfg.get("annealing_epochs"), default=20))
+    batch_log_interval = int(_coalesce(training_cfg.get("batch_log_interval"), default=10))
     max_wall_time_seconds = float(_coalesce(training_cfg.get("max_wall_time_seconds"), default=5400))
     seed = int(_coalesce(args.seed, training_cfg.get("seed"), data_cfg.get("seed"), default=42))
     val_fraction = float(_coalesce(args.val_fraction, data_cfg.get("val_fraction"), default=0.1))
@@ -533,6 +542,7 @@ def main() -> Dict[str, Any]:
     logger.info(f"Batch size: {batch_size} | Workers: {num_workers} | Epochs: {num_epochs}")
     logger.info(f"Learning rate: {learning_rate} | Weight decay: {weight_decay}")
     logger.info(f"Val fraction: {val_fraction} | Test fraction: {test_fraction}")
+    logger.info(f"Batch log interval: every {batch_log_interval} batch(es)")
     logger.info(f"Seed: {seed}")
 
     model = MM_DBGDGM(
@@ -612,6 +622,55 @@ def main() -> Dict[str, Any]:
     val_loader = dataloaders["val"]
     test_loader = dataloaders.get("test")
 
+    train_samples = len(train_loader.dataset)
+    val_samples = len(val_loader.dataset)
+    test_samples = len(test_loader.dataset) if test_loader is not None else 0
+    train_batches = len(train_loader)
+    val_batches = len(val_loader)
+    test_batches = len(test_loader) if test_loader is not None else 0
+
+    logger.info(f"Dataset samples | train={train_samples} | val={val_samples} | test={test_samples}")
+    logger.info(f"Loader batches  | train={train_batches} | val={val_batches} | test={test_batches}")
+
+    min_train_batches = int(_coalesce(training_cfg.get("min_train_batches"), default=16))
+    if train_samples > 0 and train_batches < min_train_batches:
+        adjusted_batch_size = max(1, min(batch_size, max(1, train_samples // min_train_batches)))
+        if adjusted_batch_size < batch_size:
+            logger.warning(
+                f"Train loader only has {train_batches} batches; reducing batch size from {batch_size} to {adjusted_batch_size} "
+                f"to target at least {min_train_batches} batches per epoch"
+            )
+            batch_size = adjusted_batch_size
+            dataloaders = create_dataloaders(
+                dataset_root=str(dataset_root),
+                train_metadata=str(train_metadata) if train_metadata is not None else None,
+                val_metadata=str(val_metadata) if val_metadata is not None else None,
+                test_metadata=str(test_metadata) if test_metadata is not None else None,
+                metadata_file=str(metadata_file) if metadata_file is not None else None,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                shuffle_train=True,
+                normalize=normalize,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
+                seed=seed,
+                n_roi=int(model_cfg.get("n_roi", 200)),
+                seq_len=int(model_cfg.get("seq_len", 50)),
+                n_smri_features=int(model_cfg.get("n_smri_features", 5)),
+                max_dicoms_per_series=max_dicoms_per_series,
+                smri_source_root=str(smri_source_root) if smri_source_root is not None else None,
+                fmri_path_column=fmri_path_column,
+                smri_path_column=smri_path_column,
+            )
+            train_loader = dataloaders["train"]
+            val_loader = dataloaders["val"]
+            test_loader = dataloaders.get("test")
+            logger.info(f"Adjusted loader batches | train={len(train_loader)} | val={len(val_loader)} | test={len(test_loader) if test_loader is not None else 0}")
+
+            training_cfg["batch_size"] = batch_size
+            training_cfg["num_workers"] = num_workers
+            training_cfg["batch_log_interval"] = batch_log_interval
+
     logger.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     if test_loader is not None:
         logger.info(f"Test batches: {len(test_loader)}")
@@ -657,6 +716,7 @@ def main() -> Dict[str, Any]:
         weight_decay=weight_decay,
         patience=patience,
         annealing_epochs=annealing_epochs,
+        log_every_n_batches=batch_log_interval,
         start_epoch=start_epoch,
         resume_optimizer_state=resume_optimizer_state,
         max_wall_time_seconds=max_wall_time_seconds,
