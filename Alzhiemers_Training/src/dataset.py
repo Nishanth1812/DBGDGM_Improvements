@@ -10,6 +10,36 @@ import nilearn.connectome as conn
 import numpy as np
 
 
+CLASS_FOLDER_ALIASES = {
+    'Non Demented': ('Non Demented', 'Non-Demented', 'Non_Demented', 'NonDemented', 'CN', 'Control', 'Healthy Control'),
+    'Very mild Dementia': ('Very mild Dementia', 'Very Mild Dementia', 'Very-mild Dementia', 'eMCI', 'EMCI', 'MCI'),
+    'Mild Dementia': ('Mild Dementia', 'Mild-dementia', 'lMCI', 'LMCI'),
+    'Moderate Dementia': ('Moderate Dementia', 'Moderate-dementia', 'AD', 'Alzheimer', 'Demented'),
+}
+
+
+def _normalize_folder_name(name):
+    return ' '.join(str(name).replace('_', ' ').replace('-', ' ').split()).casefold()
+
+
+def _resolve_class_dir(data_dir, class_name, aliases=()):
+    if not data_dir.exists() or not data_dir.is_dir():
+        return None
+
+    candidate_names = (class_name, *aliases)
+    for candidate_name in candidate_names:
+        candidate_dir = data_dir / candidate_name
+        if candidate_dir.is_dir():
+            return candidate_dir
+
+    normalized_candidates = {_normalize_folder_name(name) for name in candidate_names}
+    for child in data_dir.iterdir():
+        if child.is_dir() and _normalize_folder_name(child.name) in normalized_candidates:
+            return child
+
+    return None
+
+
 def _normalize_smri_volume(volume, dtype=np.float32):
     volume = np.asarray(volume, dtype=dtype)
     mean = float(volume.mean())
@@ -19,30 +49,44 @@ def _normalize_smri_volume(volume, dtype=np.float32):
     return (volume - mean) / std
 
 
-def _scan_oasis_subjects(data_dir="./data"):
+def _scan_oasis_subjects(data_dir="./data", class_map=None):
     """
     Scans the directory for OASIS jpg slices, grouping all scans per subject.
     Returns: A list of dicts {"label": int, "subject": str, "slices": [list of filepaths]}
     """
     data_dir = pathlib.Path(data_dir)
-    class_map = {
-        "Non Demented": 0,
-        "Very mild Dementia": 1,
-        "Mild Dementia": 2,
-        "Moderate Dementia": 3
+    class_map = class_map or {
+        'Non Demented': 0,
+        'Very mild Dementia': 1,
+        'Mild Dementia': 2,
+        'Moderate Dementia': 3,
     }
 
     print("[dataset] Scanning data directory for OASIS subjects...", flush=True)
     subject_scans = defaultdict(lambda: defaultdict(list))
     for class_name, label in class_map.items():
-        class_dir = data_dir / class_name
+        class_dir = _resolve_class_dir(data_dir, class_name, CLASS_FOLDER_ALIASES.get(class_name, ()))
+        if class_dir is None:
+            logging.warning("Missing class folder for %s under %s; skipping.", class_name, data_dir)
+            print(f"[dataset]   {class_name}: folder not found, skipping", flush=True)
+            continue
+
         files = sorted(class_dir.rglob("*.jpg"))
-        print(f"[dataset]   {class_name}: {len(files)} slices found", flush=True)
+        print(f"[dataset]   {class_dir.name} ({class_name}): {len(files)} slices found", flush=True)
         for file in files:
             parts = file.stem.split('_')
-            sub = "_".join(parts[:3])
-            scan = parts[3]
-            slice_num = int(parts[4])
+            if len(parts) < 3:
+                logging.warning("Skipping malformed JPG filename with too few parts: %s", file)
+                continue
+
+            sub = "_".join(parts[:-2])
+            scan = parts[-2]
+            try:
+                slice_num = int(parts[-1])
+            except ValueError:
+                logging.warning("Skipping malformed JPG filename with non-numeric slice index: %s", file)
+                continue
+
             subject_scans[(label, sub)][scan].append((slice_num, str(file)))
 
     def _scan_sort_key(scan_name):
@@ -257,7 +301,7 @@ def _compute_dynamic_fc(X,
     return G
 
 
-def _load_smri_dataset(dataset, data_dir, image_size=128, num_slices=64, dtype=np.float32):
+def _load_smri_dataset(dataset, data_dir, image_size=128, num_slices=64, dtype=np.float32, class_map=None):
     filename = f"{dataset}_smri_slices-{num_slices}_img-{image_size}.pkl"
     filepath = pathlib.Path(data_dir) / dataset / filename
 
@@ -276,7 +320,7 @@ def _load_smri_dataset(dataset, data_dir, image_size=128, num_slices=64, dtype=n
         return smri_dataset
 
     print(f"[dataset] No cached sMRI dataset found. Starting volume preprocessing...", flush=True)
-    sequences = _scan_oasis_subjects(data_dir=pathlib.Path(data_dir))
+    sequences = _scan_oasis_subjects(data_dir=pathlib.Path(data_dir), class_map=class_map)
     logging.info(f'Found {len(sequences)} subjects in {data_dir}')
 
     if len(sequences) == 0:
@@ -347,7 +391,7 @@ def _load_smri_dataset(dataset, data_dir, image_size=128, num_slices=64, dtype=n
 
 def load_dataset(dataset="oasis", window_size=15, window_stride=5, measure="correlation",
                  top_percent=10, grid_size=15, data_dir="../data", data_mode='auto',
-                 image_size=128, num_slices=64, **kwargs):
+                 image_size=128, num_slices=64, class_map=None, **kwargs):
     resolved_mode = data_mode
     if resolved_mode == 'auto':
         resolved_mode = 'smri' if dataset == 'oasis' else 'graph'
@@ -358,6 +402,7 @@ def load_dataset(dataset="oasis", window_size=15, window_stride=5, measure="corr
             data_dir=data_dir,
             image_size=image_size,
             num_slices=num_slices,
+            class_map=class_map,
         )
 
     # load dataset if already exists
@@ -378,7 +423,7 @@ def load_dataset(dataset="oasis", window_size=15, window_stride=5, measure="corr
     else:
         print(f"[dataset] No cached dataset found. Starting full preprocessing...", flush=True)
         logging.info('No existing .pkl dataset. Pre-processing image slices...')
-        sequences = _scan_oasis_subjects(data_dir=pathlib.Path(data_dir))
+        sequences = _scan_oasis_subjects(data_dir=pathlib.Path(data_dir), class_map=class_map)
         logging.info(f'Found {len(sequences)} subjects in {data_dir}')
 
         if len(sequences) == 0:
