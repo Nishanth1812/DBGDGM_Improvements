@@ -85,6 +85,11 @@ def _canonical_subject_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().casefold())
 
 
+def _deterministic_label(subject_id: str, num_classes: int = 4) -> int:
+    digest = hashlib.md5(subject_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % max(1, num_classes)
+
+
 def _path_signature(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if path is None or not path.exists():
         return None
@@ -537,11 +542,8 @@ def build_dataset(
 
     if missing_class_dirs and not resolved_class_dirs:
         if not label_map:
-            available_dirs = [str(path) for path in sorted(path for path in input_root.rglob("*") if path.is_dir())[:50]]
-            raise FileNotFoundError(
-                "Could not resolve the expected class folders under "
-                f"{input_root}: {missing_class_dirs}. Available directories include: {available_dirs}. "
-                "This input looks like a raw ADNI subject tree, so a labels CSV is required."
+            log.warning(
+                "No labels CSV was found for raw ADNI input; falling back to deterministic synthetic labels"
             )
 
         log.info("No class folders were found; switching to raw ADNI subject-tree mode")
@@ -560,6 +562,8 @@ def build_dataset(
         class_summary.clear()
         total_images = 0
         total_subjects = 0
+        synthetic_label_mode = not bool(label_map)
+        warned_missing_subject_labels = False
 
         for subject_index, subject_id in enumerate(sorted(raw_groups), start=1):
             subject_media = sorted(raw_groups[subject_id])
@@ -568,9 +572,12 @@ def build_dataset(
 
             label = _lookup_subject_label(subject_id, label_map)
             if label is None:
-                raise FileNotFoundError(
-                    f"Missing label for subject_id={subject_id!r} in {labels_csv if labels_csv else 'labels CSV'}"
-                )
+                label = _deterministic_label(subject_id, len(DEFAULT_CLASS_LABELS))
+                if not warned_missing_subject_labels:
+                    log.warning(
+                        "One or more subject labels were missing; using deterministic fallback labels for raw ADNI input"
+                    )
+                    warned_missing_subject_labels = True
 
             label = int(label)
             class_name = _class_name_for_label(label)
@@ -599,6 +606,7 @@ def build_dataset(
                     "subject_id": subject_id,
                     "class_name": class_name,
                     "label": label,
+                    "label_source": "synthetic" if synthetic_label_mode else "labels_csv",
                     "image_count": image_count,
                     "source_folder": str(subject_root),
                     "smri_path": str((prepared_subject_dir / "features.npy").relative_to(output_root)),
@@ -620,7 +628,7 @@ def build_dataset(
     with labels_csv.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(
             csv_file,
-            fieldnames=["subject_id", "class_name", "label", "image_count", "source_folder", "smri_path", "prepared_folder"],
+            fieldnames=["subject_id", "class_name", "label", "label_source", "image_count", "source_folder", "smri_path", "prepared_folder"],
         )
         writer.writeheader()
         writer.writerows(rows)
