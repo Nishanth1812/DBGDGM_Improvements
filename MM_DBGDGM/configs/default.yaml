@@ -43,6 +43,7 @@ training:
   # Data loading
   batch_size: 32
   num_workers: 20  # CPU workers for data loading on the 20-vCPU VM
+  batch_log_interval: 10  # Log training progress every N batches in the SSH terminal
   
   # Optimization
   num_epochs: 100

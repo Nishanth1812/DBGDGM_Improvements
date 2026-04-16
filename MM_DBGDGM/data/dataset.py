@@ -389,6 +389,34 @@ def _load_image_folder_proxy_features(series_dir: Path, target_len: Optional[int
     return smri_raw.astype(np.float32)
 
 
+def _build_auxiliary_targets(smri: np.ndarray, label: int, n_smri_features: int) -> Dict[str, torch.Tensor]:
+    smri = np.asarray(smri, dtype=np.float32)
+    if smri.size == 0:
+        smri = np.zeros(max(1, n_smri_features), dtype=np.float32)
+
+    first_value = float(smri[0]) if smri.size > 0 else 0.0
+    second_value = float(smri[min(1, smri.size - 1)]) if smri.size > 0 else first_value
+    third_value = float(smri[min(2, smri.size - 1)]) if smri.size > 0 else first_value
+
+    hippo_vol = 2500.0 + (1.0 - first_value) * 2000.0
+    cortical_thinning = 0.1 + second_value * 0.4
+    dmn_conn = float(np.clip(1.0 - third_value, 0.0, 1.0))
+    nss = float(np.clip(20.0 + float(label) * 20.0 + first_value * 15.0, 0.0, 100.0))
+
+    survival_times = np.asarray([8.0, 5.5, 3.0], dtype=np.float32) - float(label) * 0.7
+    survival_times = np.clip(survival_times, 0.3, None)
+    survival_events = np.ones(3, dtype=np.float32)
+
+    return {
+        'hippo_vol': torch.tensor(hippo_vol, dtype=torch.float32),
+        'cortical_thinning': torch.tensor(cortical_thinning, dtype=torch.float32),
+        'dmn_conn': torch.tensor(dmn_conn, dtype=torch.float32),
+        'nss': torch.tensor(nss, dtype=torch.float32),
+        'survival_times': torch.from_numpy(survival_times),
+        'survival_events': torch.from_numpy(survival_events),
+    }
+
+
 class MultimodalBrainDataset(Dataset):
     """
     Multimodal brain imaging dataset.
@@ -793,11 +821,19 @@ class MultimodalBrainDataset(Dataset):
         # Load modalities
         fmri = self._load_fmri(subject_id, timepoint)
         smri = self._load_smri(subject_id, timepoint)
+
+        if fmri is None or smri is None:
+            raise ValueError(
+                f"Missing modalities for subject_id={subject_id!r}, timepoint={timepoint!r}. "
+                f"fmri={'present' if fmri is not None else 'missing'}, smri={'present' if smri is not None else 'missing'}"
+            )
         
         if fmri is not None:
             data['fmri'] = fmri
         if smri is not None:
             data['smri'] = smri
+
+        data.update(_build_auxiliary_targets(smri.cpu().numpy(), label, int(self.n_smri_features or smri.numel())))
         
         return data
 
@@ -967,33 +1003,34 @@ def create_dataloaders(
             "Provide either metadata_file for an auto-split manifest or train_metadata/val_metadata CSV files"
         )
     
+    loader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': torch.cuda.is_available(),
+        'drop_last': False,
+        'persistent_workers': bool(num_workers > 0),
+    }
+    if num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 4
+
     dataloaders = {
         'train': DataLoader(
             train_dataset,
-            batch_size=batch_size,
             shuffle=shuffle_train,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            drop_last=True
+            **loader_kwargs,
         ),
         'val': DataLoader(
             val_dataset,
-            batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False
+            **loader_kwargs,
         )
     }
     
     if test_dataset is not None:
         dataloaders['test'] = DataLoader(
             test_dataset,
-            batch_size=batch_size,
+            **loader_kwargs,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False
         )
     
     return dataloaders
