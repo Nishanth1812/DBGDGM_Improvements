@@ -290,6 +290,17 @@ def _extract_zip_archive(zip_path: Path, target_dir: Path) -> None:
         zip_file.extractall(target_dir)
 
 
+def _require_existing_zip_path(raw_value: Any, base_dir: Path, label: str) -> Path:
+    candidate = _resolve_required_path(raw_value, base_dir, label)
+    if not candidate.exists():
+        raise FileNotFoundError(f"{label} not found: {candidate}")
+    if not candidate.is_file():
+        raise FileNotFoundError(f"{label} is not a file: {candidate}")
+    if candidate.suffix.lower() != ".zip":
+        raise ValueError(f"{label} must be a .zip file: {candidate}")
+    return candidate
+
+
 def _find_labels_csv(root_dir: Path) -> Optional[Path]:
     direct = root_dir / "labels.csv"
     if direct.exists():
@@ -457,8 +468,8 @@ def main() -> Dict[str, Any]:
         if args.dicom_bundle_zip is None or args.smri_zip is None:
             raise ValueError("Both --dicom-bundle-zip and --smri-zip are required in raw zip mode")
 
-        dicom_bundle_zip = _resolve_required_path(args.dicom_bundle_zip, path_base_dir, "dicom_bundle_zip")
-        smri_zip = _resolve_required_path(args.smri_zip, path_base_dir, "smri_zip")
+        dicom_bundle_zip = _require_existing_zip_path(args.dicom_bundle_zip, path_base_dir, "dicom_bundle_zip")
+        smri_zip = _require_existing_zip_path(args.smri_zip, path_base_dir, "smri_zip")
         work_dir = _resolve_optional_path(args.work_dir, path_base_dir) or (output_dir / "raw_inputs")
 
         logger.info(f"Raw zip mode enabled")
