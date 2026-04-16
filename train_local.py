@@ -97,6 +97,18 @@ def setup_logging(output_dir: Path) -> logging.Logger:
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
 
+        trainer_logger = logging.getLogger("mm-dbgdgm-modal")
+        trainer_logger.setLevel(logging.INFO)
+        trainer_logger.propagate = False
+        trainer_logger.addHandler(file_handler)
+        trainer_logger.addHandler(console_handler)
+
+        dataset_logger = logging.getLogger("MM_DBGDGM.data.dataset")
+        dataset_logger.setLevel(logging.INFO)
+        dataset_logger.propagate = False
+        dataset_logger.addHandler(file_handler)
+        dataset_logger.addHandler(console_handler)
+
     return logger
 
 
@@ -835,6 +847,9 @@ def main() -> Dict[str, Any]:
         seed=seed,
         frozen_module_names=frozen_module_names,
     )
+    logger.info(
+        "Trainer initialized; next the trainer will build the optimizer, scheduler, and heartbeat thread"
+    )
 
     start_epoch = 0
     resume_optimizer_state = None
@@ -860,7 +875,12 @@ def main() -> Dict[str, Any]:
 
         logger.info(f"Resumed from epoch {start_epoch} with best_val_loss={trainer.best_val_loss:.4f}")
 
-    logger.info("Starting training loop")
+    logger.info(
+        f"Starting training loop | epochs={num_epochs} | start_epoch={start_epoch} | "
+        f"patience={patience} | annealing_epochs={annealing_epochs} | "
+        f"batch_log_interval={batch_log_interval}"
+    )
+    logger.info("Handoff to trainer.fit beginning now")
     trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -874,6 +894,7 @@ def main() -> Dict[str, Any]:
         resume_optimizer_state=resume_optimizer_state,
         max_wall_time_seconds=max_wall_time_seconds,
     )
+    logger.info("trainer.fit returned; training loop has completed or exited early")
 
     final_model_path = output_dir / "final.pt"
     final_history_path = output_dir / "history.json"
