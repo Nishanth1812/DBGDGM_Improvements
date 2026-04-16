@@ -528,6 +528,15 @@ class MultimodalBrainDataset(Dataset):
         self._dicom_series_index: Dict[str, List[Path]] = {}
         self._dicom_series_index_canonical: Dict[str, List[Path]] = {}
         self._global_fmri_pool: List[Path] = []
+        self._pairing_stats: Dict[str, int] = {
+            'fmri_exact': 0,
+            'fmri_canonical': 0,
+            'fmri_fallback': 0,
+            'fmri_missing': 0,
+            'smri_missing': 0,
+            'kept_samples': 0,
+            'dropped_samples': 0,
+        }
         if not (self.dataset_root / 'fmri').exists():
             self._dicom_series_index = self._build_dicom_series_index()
 
@@ -699,21 +708,21 @@ class MultimodalBrainDataset(Dataset):
         
         return samples
 
-    def _resolve_fmri_source(self, sample: Dict[str, Any]) -> Optional[Path]:
+    def _resolve_fmri_source_with_strategy(self, sample: Dict[str, Any]) -> Tuple[Optional[Path], str]:
         fmri_path_value = _string_or_empty(sample.get('fmri_path')) or _string_or_empty(sample.get('fmri_folder'))
         if fmri_path_value:
             candidate = _resolve_relative_path(fmri_path_value, self.metadata_base_dir)
             if candidate is not None:
                 if candidate.is_file():
-                    return candidate
+                    return candidate, 'exact'
                 if candidate.is_dir():
                     nested = _first_existing_path([
                         candidate / 'fmri_windows_dbgdgm.npy',
                         *sorted(candidate.rglob('fmri_windows_dbgdgm.npy')),
                     ])
                     if nested is not None:
-                        return nested
-                    return candidate
+                        return nested, 'exact'
+                    return candidate, 'exact'
 
         subject_id = _string_or_empty(sample.get('subject_id'))
         timepoint = _string_or_empty(sample.get('timepoint'))
@@ -733,43 +742,50 @@ class MultimodalBrainDataset(Dataset):
 
             existing = _first_existing_path(candidates)
             if existing is not None:
-                return existing
+                return existing, 'exact'
 
             subject_dir = root / subject_id
             if subject_dir.exists():
                 nested_matches = sorted(subject_dir.rglob('fmri_windows_dbgdgm.npy'))
                 if nested_matches:
-                    return nested_matches[0]
+                    return nested_matches[0], 'exact'
 
         raw_series_candidates = self._dicom_series_index.get(subject_id, [])
         if raw_series_candidates:
-            return raw_series_candidates[0]
+            return raw_series_candidates[0], 'exact'
 
         canonical_subject = _canonical_subject_key(subject_id)
         canonical_candidates = self._dicom_series_index_canonical.get(canonical_subject, [])
         if canonical_candidates:
-            return canonical_candidates[0]
+            return canonical_candidates[0], 'canonical'
 
         unaligned_source = self._pick_unaligned_fmri_source(subject_id, timepoint)
         if unaligned_source is not None:
-            return unaligned_source
+            return unaligned_source, 'fallback'
 
-        return None
+        return None, 'missing'
 
-    def _sample_missing_modalities(self, sample: Dict[str, Any]) -> List[str]:
+    def _resolve_fmri_source(self, sample: Dict[str, Any]) -> Optional[Path]:
+        source, _ = self._resolve_fmri_source_with_strategy(sample)
+        return source
+
+    def _sample_missing_modalities(self, sample: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
         missing: List[str] = []
+        resolution: Dict[str, str] = {}
 
         if 'fmri' in self.modalities:
-            fmri_source = self._resolve_fmri_source(sample)
+            fmri_source, fmri_strategy = self._resolve_fmri_source_with_strategy(sample)
+            resolution['fmri'] = fmri_strategy
             if fmri_source is None or not fmri_source.exists():
                 missing.append('fmri')
 
         if 'smri' in self.modalities:
             smri_source = self._resolve_smri_source(sample)
+            resolution['smri'] = 'exact' if smri_source is not None and smri_source.exists() else 'missing'
             if smri_source is None or not smri_source.exists():
                 missing.append('smri')
 
-        return missing
+        return missing, resolution
 
     def _filter_incomplete_samples(self) -> None:
         if not self.samples:
@@ -779,15 +795,32 @@ class MultimodalBrainDataset(Dataset):
         dropped: List[Tuple[str, str, str]] = []
 
         for sample in self.samples:
-            missing = self._sample_missing_modalities(sample)
+            missing, resolution = self._sample_missing_modalities(sample)
+
+            fmri_resolution = resolution.get('fmri', 'missing')
+            if fmri_resolution == 'exact':
+                self._pairing_stats['fmri_exact'] += 1
+            elif fmri_resolution == 'canonical':
+                self._pairing_stats['fmri_canonical'] += 1
+            elif fmri_resolution == 'fallback':
+                self._pairing_stats['fmri_fallback'] += 1
+            else:
+                self._pairing_stats['fmri_missing'] += 1
+
+            smri_resolution = resolution.get('smri', 'missing')
+            if smri_resolution == 'missing':
+                self._pairing_stats['smri_missing'] += 1
+
             if missing:
                 dropped.append((
                     _string_or_empty(sample.get('subject_id')),
                     _string_or_empty(sample.get('timepoint')),
                     ",".join(missing),
                 ))
+                self._pairing_stats['dropped_samples'] += 1
                 continue
             kept_samples.append(sample)
+            self._pairing_stats['kept_samples'] += 1
 
         if dropped:
             preview = "; ".join(
@@ -802,6 +835,17 @@ class MultimodalBrainDataset(Dataset):
             )
 
         self.samples = kept_samples
+
+        logger.info(
+            "Pairing summary | "
+            f"kept={self._pairing_stats['kept_samples']} | "
+            f"dropped={self._pairing_stats['dropped_samples']} | "
+            f"fmri_exact={self._pairing_stats['fmri_exact']} | "
+            f"fmri_canonical={self._pairing_stats['fmri_canonical']} | "
+            f"fmri_fallback={self._pairing_stats['fmri_fallback']} | "
+            f"fmri_missing={self._pairing_stats['fmri_missing']} | "
+            f"smri_missing={self._pairing_stats['smri_missing']}"
+        )
 
         if not self.samples:
             raise ValueError(
