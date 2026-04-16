@@ -154,6 +154,10 @@ def _extract_numeric_hint_from_path(name: str) -> Optional[int]:
         return None
 
 
+def _canonical_subject_key(value: Any) -> str:
+    return "".join(ch for ch in str(value).strip().casefold() if ch.isalnum())
+
+
 def _ordered_dicom_files(series_dir: Path, max_dicoms_per_series: int) -> Tuple[List[Path], List[Any]]:
     import pydicom
 
@@ -472,6 +476,8 @@ class MultimodalBrainDataset(Dataset):
         fmri_path_column: str = 'fmri_path',
         smri_path_column: str = 'smri_path',
         metadata_base_dir: Optional[str] = None,
+        drop_incomplete_samples: bool = True,
+        strict_missing_modalities: bool = False,
         verbose: bool = False
     ):
         """
@@ -490,6 +496,8 @@ class MultimodalBrainDataset(Dataset):
             fmri_path_column: Optional metadata column name for explicit fMRI paths
             smri_path_column: Optional metadata column name for explicit sMRI paths
             metadata_base_dir: Base directory used to resolve relative metadata paths
+            drop_incomplete_samples: Drop metadata rows that cannot resolve required modality sources
+            strict_missing_modalities: Raise errors for missing modalities at __getitem__ time
             verbose: Print loading information
         """
         self.dataset_root = Path(dataset_root)
@@ -507,13 +515,19 @@ class MultimodalBrainDataset(Dataset):
         self.smri_source_root = Path(smri_source_root) if smri_source_root else None
         self.fmri_path_column = fmri_path_column
         self.smri_path_column = smri_path_column
+        self.drop_incomplete_samples = bool(drop_incomplete_samples)
+        self.strict_missing_modalities = bool(strict_missing_modalities)
         self.verbose = verbose
         
         # Load metadata
         self.samples = self._normalize_samples(samples) if samples is not None else self._load_metadata()
         self._dicom_series_index: Dict[str, List[Path]] = {}
+        self._dicom_series_index_canonical: Dict[str, List[Path]] = {}
         if not (self.dataset_root / 'fmri').exists():
             self._dicom_series_index = self._build_dicom_series_index()
+
+        if self.drop_incomplete_samples and len(self.modalities) > 1:
+            self._filter_incomplete_samples()
         
         if self.verbose:
             logger.info(f"Loaded {len(self.samples)} samples from {self.dataset_root}")
@@ -571,6 +585,26 @@ class MultimodalBrainDataset(Dataset):
                 len(path.parts),
                 path.name.lower(),
             ))
+
+        canonical_index: Dict[str, List[Path]] = {}
+        for subject_id, candidate_dirs in dicom_index.items():
+            canonical_key = _canonical_subject_key(subject_id)
+            if not canonical_key:
+                continue
+            canonical_index.setdefault(canonical_key, []).extend(candidate_dirs)
+
+        for canonical_key, candidate_dirs in canonical_index.items():
+            deduped = sorted(
+                set(candidate_dirs),
+                key=lambda path: (
+                    0 if _series_has_fmri_clue(path) else 1,
+                    len(path.parts),
+                    path.name.lower(),
+                ),
+            )
+            canonical_index[canonical_key] = deduped
+
+        self._dicom_series_index_canonical = canonical_index
 
         if self.verbose:
             logger.info(f"Indexed {sum(len(paths) for paths in dicom_index.values())} raw DICOM series for fallback lookup")
@@ -667,7 +701,65 @@ class MultimodalBrainDataset(Dataset):
         if raw_series_candidates:
             return raw_series_candidates[0]
 
+        canonical_subject = _canonical_subject_key(subject_id)
+        canonical_candidates = self._dicom_series_index_canonical.get(canonical_subject, [])
+        if canonical_candidates:
+            return canonical_candidates[0]
+
         return None
+
+    def _sample_missing_modalities(self, sample: Dict[str, Any]) -> List[str]:
+        missing: List[str] = []
+
+        if 'fmri' in self.modalities:
+            fmri_source = self._resolve_fmri_source(sample)
+            if fmri_source is None or not fmri_source.exists():
+                missing.append('fmri')
+
+        if 'smri' in self.modalities:
+            smri_source = self._resolve_smri_source(sample)
+            if smri_source is None or not smri_source.exists():
+                missing.append('smri')
+
+        return missing
+
+    def _filter_incomplete_samples(self) -> None:
+        if not self.samples:
+            return
+
+        kept_samples: List[Dict[str, Any]] = []
+        dropped: List[Tuple[str, str, str]] = []
+
+        for sample in self.samples:
+            missing = self._sample_missing_modalities(sample)
+            if missing:
+                dropped.append((
+                    _string_or_empty(sample.get('subject_id')),
+                    _string_or_empty(sample.get('timepoint')),
+                    ",".join(missing),
+                ))
+                continue
+            kept_samples.append(sample)
+
+        if dropped:
+            preview = "; ".join(
+                f"{subject_id or '<empty-subject>'}:{timepoint or '<empty-timepoint>'} [{missing}]"
+                for subject_id, timepoint, missing in dropped[:8]
+            )
+            if len(dropped) > 8:
+                preview = f"{preview}; ... (+{len(dropped) - 8} more)"
+
+            logger.warning(
+                f"Dropping {len(dropped)}/{len(self.samples)} sample(s) with unresolved modalities before training: {preview}"
+            )
+
+        self.samples = kept_samples
+
+        if not self.samples:
+            raise ValueError(
+                "No valid samples remain after dropping unresolved modality rows. "
+                "Check metadata paths and extracted raw inputs."
+            )
 
     def _resolve_smri_source(self, sample: Dict[str, Any]) -> Optional[Path]:
         smri_path_value = (
@@ -858,9 +950,23 @@ class MultimodalBrainDataset(Dataset):
         smri = self._load_smri(sample)
 
         if fmri is None or smri is None:
-            raise ValueError(
-                f"Missing modalities for subject_id={subject_id!r}, timepoint={timepoint!r}. "
-                f"fmri={'present' if fmri is not None else 'missing'}, smri={'present' if smri is not None else 'missing'}"
+            if self.strict_missing_modalities:
+                raise ValueError(
+                    f"Missing modalities for subject_id={subject_id!r}, timepoint={timepoint!r}. "
+                    f"fmri={'present' if fmri is not None else 'missing'}, smri={'present' if smri is not None else 'missing'}"
+                )
+
+            if fmri is None:
+                fmri = torch.zeros(
+                    (int(self.n_roi or 200), int(self.seq_len or 50)),
+                    dtype=torch.float32,
+                )
+            if smri is None:
+                smri = torch.zeros((int(self.n_smri_features or 5),), dtype=torch.float32)
+
+            logger.warning(
+                f"Missing modality encountered at runtime for subject_id={subject_id!r}, timepoint={timepoint!r}; "
+                "using zero-filled fallback tensor(s)"
             )
         
         if fmri is not None:
