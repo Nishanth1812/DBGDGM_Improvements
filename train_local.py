@@ -664,19 +664,19 @@ def main() -> Dict[str, Any]:
 
     logger.info("Initializing model")
     model_kwargs = {
-        n_roi=int(model_cfg.get("n_roi", 200)),
-        seq_len=int(model_cfg.get("seq_len", 50)),
-        gru_hidden=int(model_cfg.get("gru_hidden", 128)),
-        gru_layers=int(model_cfg.get("gru_layers", 2)),
-        n_smri_features=int(model_cfg.get("n_smri_features", 5)),
-        max_dicoms_per_series=max_dicoms_per_series,
-        use_gat_encoder=bool(model_cfg.get("use_gat_encoder", True)),
-        latent_dim=int(model_cfg.get("latent_dim", 256)),
-        num_classes=int(model_cfg.get("num_classes", 4)),
-        use_attention_fusion=bool(model_cfg.get("use_attention_fusion", True)),
-        num_fusion_heads=int(model_cfg.get("num_fusion_heads", 4)),
-        num_fusion_iterations=int(model_cfg.get("num_fusion_iterations", 2)),
-        dropout=float(model_cfg.get("dropout", 0.1)),
+        "n_roi": int(model_cfg.get("n_roi", 200)),
+        "seq_len": int(model_cfg.get("seq_len", 50)),
+        "gru_hidden": int(model_cfg.get("gru_hidden", 128)),
+        "gru_layers": int(model_cfg.get("gru_layers", 2)),
+        "n_smri_features": int(model_cfg.get("n_smri_features", 5)),
+        "max_dicoms_per_series": max_dicoms_per_series,
+        "use_gat_encoder": bool(model_cfg.get("use_gat_encoder", True)),
+        "latent_dim": int(model_cfg.get("latent_dim", 256)),
+        "num_classes": int(model_cfg.get("num_classes", 4)),
+        "use_attention_fusion": bool(model_cfg.get("use_attention_fusion", True)),
+        "num_fusion_heads": int(model_cfg.get("num_fusion_heads", 4)),
+        "num_fusion_iterations": int(model_cfg.get("num_fusion_iterations", 2)),
+        "dropout": float(model_cfg.get("dropout", 0.1)),
     }
 
     constructor_signature = inspect.signature(MM_DBGDGM.__init__)
