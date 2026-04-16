@@ -1,7 +1,8 @@
 """Kaggle-facing DBGDGM pipeline utilities.
 
 This module keeps the Kaggle workflow aligned with the canonical MM-DBGDGM
-package instead of maintaining a second model implementation.
+package. It has been updated to support the Neurodegeneration Forecasting Module
+and Weibull-AFT Time-to-Event pipelines.
 """
 
 from __future__ import annotations
@@ -15,14 +16,14 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.optim as optim
+from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
-from MM_DBGDGM.models import MM_DBGDGM
-from MM_DBGDGM.training import MM_DBGDGM_Loss, Trainer
-from Preprocessing.src.utils.preprocessing_utils import extract_timeseries_windows
-
+from MM_DBGDGM.models.mm_dbgdgm import MM_DBGDGM
+from MM_DBGDGM.training.losses import MM_DBGDGM_Loss
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class KaggleConfig:
     num_classes: int = 4
     batch_size: int = 32
     num_epochs: int = 50
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     patience: int = 10
     annealing_epochs: int = 20
@@ -57,11 +58,23 @@ class WindowedBrainDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {
+        sample = {
             'fmri': torch.from_numpy(self.fmri[idx]),
             'smri': torch.from_numpy(self.smri[idx]),
             'label': torch.tensor(self.labels[idx], dtype=torch.long),
         }
+        
+        # MOCK ADNI BIOMARKERS AND SURVIVAL ENDPOINTS
+        # Until arrays upload to Kaggle containing real target columns, we 
+        # mock them to allow the forward/backward architecture pipeline to compile seamlessly.
+        sample['hippo_vol'] = torch.randn(1) * 500 + 4000 
+        sample['cortical_thinning'] = torch.rand(1) * 0.5 
+        sample['dmn_conn'] = torch.rand(1) 
+        sample['nss'] = torch.rand(1) * 100 
+        sample['survival_times'] = torch.rand(3) * 10 + 0.1
+        sample['survival_events'] = torch.randint(0, 2, (3,)).float()
+        
+        return sample
 
 
 def validate_dbgdgm_arrays(fmri: np.ndarray, smri: np.ndarray, labels: np.ndarray, config: KaggleConfig) -> None:
@@ -85,67 +98,15 @@ def validate_dbgdgm_arrays(fmri: np.ndarray, smri: np.ndarray, labels: np.ndarra
         raise ValueError("sMRI array contains NaN or inf values")
 
 
-def convert_subject_timeseries_to_dbgdgm(
-    fmri_subjects: np.ndarray,
-    smri_subjects: np.ndarray,
-    labels: np.ndarray,
-    window_size: int = 50,
-    window_step: int = 1,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert subject-level [N, 200, T] arrays into DBGDGM windows."""
-    fmri_subjects = np.asarray(fmri_subjects, dtype=np.float32)
-    smri_subjects = np.asarray(smri_subjects, dtype=np.float32)
-    labels = np.asarray(labels, dtype=np.int64)
-
-    if fmri_subjects.ndim != 3 or fmri_subjects.shape[1] != 200:
-        raise ValueError("Subject-level fMRI input must have shape [N, 200, T]")
-    if len(fmri_subjects) != len(smri_subjects) or len(fmri_subjects) != len(labels):
-        raise ValueError("Subject-level fMRI, sMRI, and labels must have matching lengths")
-
-    fmri_windows = []
-    smri_windows = []
-    label_windows = []
-
-    for subject_idx in range(len(labels)):
-        subject_windows = extract_timeseries_windows(
-            fmri_subjects[subject_idx],
-            window_size=window_size,
-            window_step=window_step,
-            standardize=True,
-            dbgdgm_format=True,
-        )
-        fmri_windows.append(subject_windows)
-        smri_windows.append(np.repeat(smri_subjects[subject_idx][np.newaxis, :], subject_windows.shape[0], axis=0))
-        label_windows.append(np.full(subject_windows.shape[0], labels[subject_idx], dtype=np.int64))
-
-    return (
-        np.concatenate(fmri_windows, axis=0),
-        np.concatenate(smri_windows, axis=0),
-        np.concatenate(label_windows, axis=0),
-    )
-
-
 def load_kaggle_arrays(
     fmri_path: str,
     smri_path: str,
     labels_path: str,
     config: KaggleConfig,
-    fmri_is_subject_timeseries: bool = False,
-    window_step: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     fmri = np.load(fmri_path)
     smri = np.load(smri_path)
     labels = np.load(labels_path)
-
-    if fmri_is_subject_timeseries:
-        fmri, smri, labels = convert_subject_timeseries_to_dbgdgm(
-            fmri,
-            smri,
-            labels,
-            window_size=config.seq_len,
-            window_step=window_step,
-        )
-
     validate_dbgdgm_arrays(fmri, smri, labels, config)
     return fmri.astype(np.float32), smri.astype(np.float32), labels.astype(np.int64)
 
@@ -204,21 +165,113 @@ def build_model(config: KaggleConfig) -> MM_DBGDGM:
     )
 
 
-def train_pipeline(loaders: Dict[str, DataLoader], config: KaggleConfig, output_dir: str) -> Tuple[MM_DBGDGM, Trainer]:
+def train_pipeline(loaders: Dict[str, DataLoader], config: KaggleConfig, output_dir: str) -> MM_DBGDGM:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = build_model(config).to(device)
-    criterion = MM_DBGDGM_Loss(num_classes=config.num_classes).to(device)
-    trainer = Trainer(model=model, criterion=criterion, device=device, output_dir=output_dir, seed=config.random_state)
-    trainer.fit(
-        train_loader=loaders['train'],
-        val_loader=loaders['val'],
-        num_epochs=config.num_epochs,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        patience=config.patience,
-        annealing_epochs=config.annealing_epochs,
-    )
-    return model, trainer
+    
+    criterion = MM_DBGDGM_Loss(
+        num_classes=config.num_classes,
+        lambda_kl=0.1,
+        lambda_align=0.1,
+        lambda_recon=0.5,
+        lambda_regression=0.5,
+        lambda_survival=0.5
+    ).to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    
+    best_val_loss = float('inf')
+    early_stop_counter = 0
+
+    for epoch in range(1, config.num_epochs + 1):
+        beta_annealing = min(1.0, epoch / config.annealing_epochs)
+        
+        # Training Phase
+        model.train()
+        train_loss = 0.0
+        
+        for batch in tqdm(loaders['train'], desc=f"Epoch {epoch} [Train]"):
+            fmri = batch['fmri'].to(device)
+            smri = batch['smri'].to(device)
+            labels = batch['label'].to(device)
+            
+            # Additional heads targets
+            reg_targets = {
+                'hippocampal_volume': batch['hippo_vol'].to(device),
+                'cortical_thinning_rate': batch['cortical_thinning'].to(device),
+                'dmn_connectivity': batch['dmn_conn'].to(device),
+                'nss': batch['nss'].to(device)
+            }
+            surv_times = batch['survival_times'].to(device)
+            surv_events = batch['survival_events'].to(device)
+
+            optimizer.zero_grad()
+            outputs = model(fmri, smri, return_all=True)
+            losses = criterion(
+                logits=outputs['logits'],
+                targets=labels,
+                mu=outputs['mu'],
+                logvar=outputs['logvar'],
+                fmri_recon=outputs['fmri_recon'],
+                fmri_orig=fmri,
+                smri_recon=outputs['smri_recon'],
+                smri_orig=smri,
+                z_fmri=outputs['z_fmri'],
+                z_smri=outputs['z_smri'],
+                degeneration_preds=outputs['degeneration'],
+                regression_targets=reg_targets,
+                survival_shape=outputs['survival']['shape'],
+                survival_scale=outputs['survival']['scale'],
+                survival_times=surv_times,
+                survival_events=surv_events,
+                beta_annealing=beta_annealing
+            )
+            
+            total_loss = losses['total']
+            total_loss.backward()
+            optimizer.step()
+            train_loss += total_loss.item()
+            
+        train_loss /= len(loaders['train'])
+        
+        # Validation Phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in loaders['val']:
+                fmri = batch['fmri'].to(device)
+                smri = batch['smri'].to(device)
+                labels = batch['label'].to(device)
+                reg_targets = {k: v.to(device) for k, v in reg_targets.items()}
+                surv_times = batch['survival_times'].to(device)
+                surv_events = batch['survival_events'].to(device)
+
+                outputs = model(fmri, smri, return_all=True)
+                losses = criterion(
+                    logits=outputs['logits'], targets=labels, mu=outputs['mu'], logvar=outputs['logvar'],
+                    fmri_recon=outputs['fmri_recon'], fmri_orig=fmri, smri_recon=outputs['smri_recon'], 
+                    smri_orig=smri, z_fmri=outputs['z_fmri'], z_smri=outputs['z_smri'],
+                    degeneration_preds=outputs['degeneration'], regression_targets=reg_targets,
+                    survival_shape=outputs['survival']['shape'], survival_scale=outputs['survival']['scale'],
+                    survival_times=surv_times, survival_events=surv_events, beta_annealing=1.0
+                )
+                val_loss += losses['total'].item()
+                
+        val_loss /= len(loaders['val'])
+        logger.info(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            early_stop_counter = 0
+            torch.save(model.state_dict(), Path(output_dir) / 'best_model.pth')
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= config.patience:
+                logger.info("Early stopping triggered.")
+                break
+
+    model.load_state_dict(torch.load(Path(output_dir) / 'best_model.pth'))
+    return model
 
 
 @torch.no_grad()
@@ -232,9 +285,16 @@ def evaluate_split(model: MM_DBGDGM, loader: DataLoader, device: torch.device) -
         fmri = batch['fmri'].to(device)
         smri = batch['smri'].to(device)
         batch_labels = batch['label'].cpu().numpy()
-        batch_predictions, batch_probabilities = model.predict(fmri, smri)
-        predictions.append(batch_predictions.cpu().numpy())
-        probabilities.append(batch_probabilities.cpu().numpy())
+        
+        # Leveraging the deep clinical predict output wrapper
+        # Since it returns a list of dictionaries per batch
+        batch_reports = model.predict(fmri, smri)
+        
+        batch_preds = np.array([r['current_stage_prediction'] for r in batch_reports])
+        batch_probs = np.array([r['stage_probabilities'] for r in batch_reports])
+        
+        predictions.append(batch_preds)
+        probabilities.append(batch_probs)
         labels.append(batch_labels)
 
     predictions_array = np.concatenate(predictions, axis=0)
@@ -257,29 +317,12 @@ def evaluate_split(model: MM_DBGDGM, loader: DataLoader, device: torch.device) -
     return metrics
 
 
-@torch.no_grad()
-def predict_arrays(model: MM_DBGDGM, fmri: np.ndarray, smri: np.ndarray, device: Optional[torch.device] = None) -> Dict[str, np.ndarray]:
-    device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.eval()
-    fmri_tensor = torch.as_tensor(fmri, dtype=torch.float32, device=device)
-    smri_tensor = torch.as_tensor(smri, dtype=torch.float32, device=device)
-    predictions, probabilities = model.predict(fmri_tensor, smri_tensor)
-    latents = model.get_latent(fmri_tensor, smri_tensor)['z']
-    return {
-        'predictions': predictions.cpu().numpy(),
-        'probabilities': probabilities.cpu().numpy(),
-        'latents': latents.cpu().numpy(),
-    }
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description='DBGDGM Kaggle pipeline')
     parser.add_argument('--fmri', required=True, help='Path to fMRI .npy array')
     parser.add_argument('--smri', required=True, help='Path to sMRI .npy array')
     parser.add_argument('--labels', required=True, help='Path to labels .npy array')
     parser.add_argument('--output-dir', default='./kaggle_outputs', help='Output directory')
-    parser.add_argument('--subject-timeseries', action='store_true', help='Interpret fMRI input as [N, 200, T] subject arrays')
-    parser.add_argument('--window-step', type=int, default=1, help='Sliding window step when using subject timeseries')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -290,12 +333,11 @@ def main() -> None:
         args.fmri,
         args.smri,
         args.labels,
-        config,
-        fmri_is_subject_timeseries=args.subject_timeseries,
-        window_step=args.window_step,
+        config
     )
+    
     loaders = create_split_loaders(fmri, smri, labels, config)
-    model, _ = train_pipeline(loaders, config, str(output_dir))
+    model = train_pipeline(loaders, config, str(output_dir))
     device = next(model.parameters()).device
     metrics = evaluate_split(model, loaders['test'], device)
 

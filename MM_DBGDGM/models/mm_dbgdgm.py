@@ -12,11 +12,17 @@ try:
     from .smri_encoder import StructuralGraphEncoder, SimplesMRIEncoder
     from .fusion_module import BidirectionalCrossModalFusion, SimpleFusion
     from .vae import CompleteVAE
+    from .classifier import ClassificationHead
+    from .degeneration_head import NeurodegenerationHead
+    from .survival_head import WeibullSurvivalHead
 except ImportError:
     from models.dbgdgm_encoder import DBGDGMfMRIEncoder
     from models.smri_encoder import StructuralGraphEncoder, SimplesMRIEncoder
     from models.fusion_module import BidirectionalCrossModalFusion, SimpleFusion
     from models.vae import CompleteVAE
+    from models.classifier import ClassificationHead
+    from models.degeneration_head import NeurodegenerationHead
+    from models.survival_head import WeibullSurvivalHead
 
 
 class MM_DBGDGM(nn.Module):
@@ -109,16 +115,40 @@ class MM_DBGDGM(nn.Module):
             self.fusion = SimpleFusion(latent_dim=latent_dim)
         
         # 4. VAE Module
-        print(f"  → VAE: {num_classes} classes")
+        print(f"  → VAE: Latent dim {latent_dim}")
         self.vae = CompleteVAE(
             latent_dim=latent_dim,
-            num_classes=num_classes,
             n_roi=n_roi,
             n_time=seq_len,
             n_smri_features=n_smri_features,
             hidden_dims_encoder=[512, 256],
-            hidden_dims_classifier=[512, 256],
             hidden_dims_decoder=[512, 1024],
+            dropout=dropout
+        )
+        
+        # 5. Classification Head
+        print(f"  → Classifier: {num_classes} classes")
+        self.classifier = ClassificationHead(
+            latent_dim=latent_dim,
+            num_classes=num_classes,
+            hidden_dims=[512, 256],
+            dropout=dropout
+        )
+        
+        # 6. Neurodegeneration Forecasting Head
+        print(f"  → Neurodegeneration Head: Localization & Regression")
+        self.degeneration_head = NeurodegenerationHead(
+            latent_dim=latent_dim,
+            n_roi=n_roi,
+            dropout=dropout
+        )
+        
+        # 7. Survival Head (Weibull AFT)
+        print(f"  → Survival Head: Weibull AFT model (3 transition events)")
+        self.survival_head = WeibullSurvivalHead(
+            latent_dim=latent_dim,
+            num_events=3,
+            hidden_dims=[256, 128],
             dropout=dropout
         )
         
@@ -151,6 +181,8 @@ class MM_DBGDGM(nn.Module):
                 - fmri_attn: dict (if return_all)
                 - smri_attn: dict (if return_all)
                 - fusion_attn: dict (if return_all)
+                - degeneration: dict of regression and localization targets
+                - survival: dict of 'shape' and 'scale' params
         """
         # 1. Encode modalities
         z_fmri, fmri_attn = self.fmri_encoder(fmri)
@@ -159,14 +191,28 @@ class MM_DBGDGM(nn.Module):
         # 2. Fuse modalities
         z_fused, fusion_attn = self.fusion(z_fmri, z_smri)
         
-        # 3. VAE encoder + classifier + decoder
+        # 3. VAE encoder (fusion -> mu, logvar, z, recon if return_all)
         vae_outputs = self.vae(z_fused, return_all=return_all)
+        
+        # 4. Disease Classification
+        classifier_input = vae_outputs['z'] if self.training else vae_outputs['mu']
+        logits = self.classifier(classifier_input)
+        
+        # 5. Neurodegeneration Forecasting
+        degeneration_outputs = self.degeneration_head(z_fused)
+        
+        # 6. Survival Analysis Prediction
+        survival_outputs = self.survival_head(vae_outputs['mu'])
         
         # Prepare output
         outputs = {
-            'logits': vae_outputs['logits'],
-            'predictions': torch.argmax(vae_outputs['logits'], dim=1),
-            'z': vae_outputs['z']
+            'logits': logits,
+            'predictions': torch.argmax(logits, dim=1),
+            'z': vae_outputs['z'],
+            'mu': vae_outputs['mu'],
+            'logvar': vae_outputs['logvar'],
+            'degeneration': degeneration_outputs,
+            'survival': survival_outputs
         }
         
         if return_all:
@@ -174,10 +220,8 @@ class MM_DBGDGM(nn.Module):
                 'z_fmri': z_fmri,
                 'z_smri': z_smri,
                 'z_fused': z_fused,
-                'mu': vae_outputs['mu'],
-                'logvar': vae_outputs['logvar'],
-                'fmri_recon': vae_outputs['fmri_recon'],
-                'smri_recon': vae_outputs['smri_recon'],
+                'fmri_recon': vae_outputs.get('fmri_recon'),
+                'smri_recon': vae_outputs.get('smri_recon'),
                 'fmri_attn': fmri_attn,
                 'smri_attn': smri_attn,
                 'fusion_attn': fusion_attn
@@ -188,26 +232,63 @@ class MM_DBGDGM(nn.Module):
     def predict(
         self,
         fmri: torch.Tensor,
-        smri: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        smri: torch.Tensor,
+        uncertainty_threshold: float = 0.5
+    ) -> Dict:
         """
-        Inference method: returns class predictions and probabilities.
+        Deep clinical reporting inference method.
         
         Args:
             fmri: [batch_size, n_roi, seq_len]
             smri: [batch_size, n_smri_features]
+            uncertainty_threshold: threshold sum(logvar) to flag uncertainty
         
         Returns:
-            predictions: [batch_size] - class IDs
-            probabilities: [batch_size, num_classes] - softmax probabilities
+            dict containing comprehensive subject predictions.
         """
         self.eval()
         with torch.no_grad():
             outputs = self.forward(fmri, smri, return_all=False)
+            
             predictions = outputs['predictions']
             probabilities = torch.softmax(outputs['logits'], dim=1)
+            
+            # Compute uncertainty based on VAE posterior variance
+            variance = torch.exp(outputs['logvar'])
+            mean_variance = torch.mean(variance, dim=1)
+            uncertainty_flags = (mean_variance > uncertainty_threshold)
+            
+            # Extract degeneration predictions
+            deg = outputs['degeneration']
+            
+            # Extract survival parameters
+            surv = outputs['survival']
+            shape, scale = surv['shape'], surv['scale']
+            expected_time = self.survival_head.expected_time(shape, scale)
+            
+            clinical_reports = []
+            batch_size = fmri.size(0)
+            
+            for i in range(batch_size):
+                report = {
+                    'current_stage_prediction': predictions[i].item(),
+                    'stage_probabilities': probabilities[i].cpu().numpy(),
+                    'atrophy_localization_scores': deg['atrophy_localization'][i].cpu().numpy(),
+                    'hippocampal_volume': deg['hippocampal_volume'][i].item(),
+                    'cortical_thinning_rate': deg['cortical_thinning_rate'][i].item(),
+                    'dmn_connectivity': deg['dmn_connectivity'][i].item(),
+                    'nss_score': deg['nss'][i].item(),
+                    'survival_shape': shape[i].cpu().numpy(),
+                    'survival_scale': scale[i].cpu().numpy(),
+                    'expected_time_to_events': expected_time[i].cpu().numpy(),
+                    'uncertainty_flag': uncertainty_flags[i].item(),
+                    'mean_posterior_variance': mean_variance[i].item()
+                }
+                clinical_reports.append(report)
         
-        return predictions, probabilities
+        if batch_size == 1:
+            return clinical_reports[0]
+        return clinical_reports
     
     def get_latent(
         self,

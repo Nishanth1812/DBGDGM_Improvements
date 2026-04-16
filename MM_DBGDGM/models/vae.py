@@ -1,7 +1,6 @@
 """
 Variational Autoencoder (VAE) Module
 Encodes fused multimodal representation into latent code z with:
-- Classification head for disease prediction
 - Generative decoder for reconstruction
 - KL divergence for regularization
 """
@@ -62,65 +61,6 @@ class VAEEncoder(nn.Module):
         
         return mu, logvar
 
-
-class ClassificationHead(nn.Module):
-    """
-    Classification head for disease diagnosis.
-    Uses μ (mean of latent distribution) at inference time.
-    """
-    
-    def __init__(
-        self,
-        latent_dim: int,
-        num_classes: int = 4,  # CN, eMCI, lMCI, AD
-        hidden_dims: list = [512, 256],
-        dropout: float = 0.2
-    ):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.num_classes = num_classes
-        
-        # Build classifier layers
-        layers = []
-        prev_dim = latent_dim
-        
-        for i, hidden_dim in enumerate(hidden_dims):
-            if i == 0:
-                layers.append(nn.Linear(prev_dim, hidden_dim))
-            else:
-                layers.extend([
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(prev_dim, hidden_dim)
-                ])
-            
-            if i < len(hidden_dims) - 1:
-                layers.extend([
-                    nn.ReLU(),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.Dropout(dropout)
-                ])
-            
-            prev_dim = hidden_dim
-        
-        layers.extend([
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(prev_dim, num_classes)
-        ])
-        
-        self.classifier = nn.Sequential(*layers)
-    
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [batch_size, latent_dim]
-        
-        Returns:
-            logits: [batch_size, num_classes]
-        """
-        logits = self.classifier(z)
-        return logits
 
 
 class GenerativeDecoder(nn.Module):
@@ -202,7 +142,6 @@ class CompleteVAE(nn.Module):
     """
     Complete VAE module combining:
     - Encoder (z_fused → μ, logvar)
-    - Classifier head
     - Generative decoder
     """
     
@@ -221,20 +160,11 @@ class CompleteVAE(nn.Module):
         super().__init__()
         
         self.latent_dim = latent_dim
-        self.num_classes = num_classes
         
         # VAE Encoder
         self.encoder = VAEEncoder(
             latent_dim=latent_dim,
             hidden_dims=hidden_dims_encoder,
-            dropout=dropout
-        )
-        
-        # Classification head
-        self.classifier = ClassificationHead(
-            latent_dim=latent_dim,
-            num_classes=num_classes,
-            hidden_dims=hidden_dims_classifier,
             dropout=dropout
         )
         
@@ -279,7 +209,6 @@ class CompleteVAE(nn.Module):
                 - mu: [batch_size, latent_dim]
                 - logvar: [batch_size, latent_dim]
                 - z: [batch_size, latent_dim]
-                - logits: [batch_size, num_classes]
                 - fmri_recon: [batch_size, n_roi, n_time]
                 - smri_recon: [batch_size, n_smri_features]
         """
@@ -288,10 +217,6 @@ class CompleteVAE(nn.Module):
         
         # Sample z from posterior
         z = self.reparameterize(mu, logvar)
-
-        # Use stochastic samples during training and deterministic means during evaluation.
-        classifier_input = z if self.training else mu
-        logits = self.classifier(classifier_input)
         
         # Reconstruction
         fmri_recon, smri_recon = self.decoder(z)
@@ -300,22 +225,12 @@ class CompleteVAE(nn.Module):
             'mu': mu,
             'logvar': logvar,
             'z': z,
-            'logits': logits,
             'fmri_recon': fmri_recon,
             'smri_recon': smri_recon
         }
         
         if not return_all:
-            # At inference, only return predictions
-            outputs = {k: v for k, v in outputs.items() if k in ['logits', 'z']}
+            # At inference, only return the variables needed
+            outputs = {k: v for k, v in outputs.items() if k in ['z', 'mu']}
         
         return outputs
-    
-    def classify(self, z_fused: torch.Tensor) -> torch.Tensor:
-        """
-        Inference-only method: classify without reconstruction.
-        Uses μ for deterministic predictions.
-        """
-        mu, _ = self.encoder(z_fused)
-        logits = self.classifier(mu)
-        return logits

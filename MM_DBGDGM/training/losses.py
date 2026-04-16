@@ -124,12 +124,56 @@ class AlignmentLoss(nn.Module):
         
         return alignment_loss
 
+class BiomarkerRegressionLoss(nn.Module):
+    """
+    Computes MSE loss for continuous neurodegeneration targets.
+    """
+    def __init__(self):
+        super().__init__()
+        # Can also use HuberLoss for robustness to outliers
+        self.criterion = nn.HuberLoss(reduction='mean')
+        
+    def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+        loss = 0.0
+        keys = ['hippocampal_volume', 'cortical_thinning_rate', 'dmn_connectivity', 'nss']
+        for k in keys:
+            if k in targets:
+                loss += self.criterion(preds[k], targets[k])
+        return loss / max(1, len(targets))
+
+class WeibullSurvivalLoss(nn.Module):
+    """
+    Negative Log-Likelihood for Weibull AFT model handling right-censored data.
+    """
+    def forward(self, shape: torch.Tensor, scale: torch.Tensor, times: torch.Tensor, events: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            shape: [batch_size, num_events]
+            scale: [batch_size, num_events]
+            times: [batch_size, num_events] - observed or censored time
+            events: [batch_size, num_events] - 1 if event occurred, 0 if censored
+        """
+        # Ensure time > 0
+        t = times + 1e-6
+        
+        # log(S(t)) = -(t/scale)^shape
+        log_surv = -torch.pow(t / scale, shape)
+        
+        # log(h(t)) = log(shape) - log(scale) + (shape-1)*log(t/scale)
+        log_haz = torch.log(shape) - torch.log(scale) + (shape - 1.0) * torch.log(t / scale)
+        
+        # LogLikelihood = event * log(h(t)) + log(S(t))
+        ll = events * log_haz + log_surv
+        
+        return -torch.mean(ll)
+
+
 
 class MM_DBGDGM_Loss(nn.Module):
     """
     Complete loss function for MM-DBGDGM.
     
-    L_total = L_class + β·L_KL + λ·L_align + λ·L_recon
+    L_total = L_class + β·L_KL + λ·L_align + λ·L_recon + λ·L_regression + λ·L_survival
     """
     
     def __init__(
@@ -138,6 +182,10 @@ class MM_DBGDGM_Loss(nn.Module):
         lambda_kl: float = 0.1,
         lambda_align: float = 0.1,
         lambda_recon: float = 0.1,
+        lambda_regression: float = 0.1,
+        lambda_survival: float = 0.1,
+        fmri_recon_weight: float = 2.0,
+        smri_recon_weight: float = 1.0,
         class_weights: Optional[Dict[int, float]] = None
     ):
         super().__init__()
@@ -145,6 +193,8 @@ class MM_DBGDGM_Loss(nn.Module):
         self.lambda_kl = lambda_kl
         self.lambda_align = lambda_align
         self.lambda_recon = lambda_recon
+        self.lambda_regression = lambda_regression
+        self.lambda_survival = lambda_survival
         
         # Component losses
         if class_weights is not None:
@@ -154,8 +204,13 @@ class MM_DBGDGM_Loss(nn.Module):
         
         self.classification = ClassificationLoss(num_classes, weight=weights)
         self.kl_divergence = KLDivergenceLoss()
-        self.reconstruction = ReconstructionLoss(fmri_weight=2.0, smri_weight=1.0)
+        self.reconstruction = ReconstructionLoss(
+            fmri_weight=fmri_recon_weight,
+            smri_weight=smri_recon_weight
+        )
         self.alignment = AlignmentLoss()
+        self.regression = BiomarkerRegressionLoss()
+        self.survival = WeibullSurvivalLoss()
     
     def forward(
         self,
@@ -169,6 +224,12 @@ class MM_DBGDGM_Loss(nn.Module):
         smri_orig: torch.Tensor,
         z_fmri: torch.Tensor,
         z_smri: torch.Tensor,
+        degeneration_preds: Dict[str, torch.Tensor],
+        regression_targets: Dict[str, torch.Tensor],
+        survival_shape: torch.Tensor,
+        survival_scale: torch.Tensor,
+        survival_times: torch.Tensor,
+        survival_events: torch.Tensor,
         beta_annealing: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
@@ -191,6 +252,8 @@ class MM_DBGDGM_Loss(nn.Module):
                 - kl: scalar
                 - recon: scalar
                 - alignment: scalar
+                - regression: scalar
+                - survival: scalar
                 - total: scalar
         """
         # Classification loss
@@ -206,12 +269,20 @@ class MM_DBGDGM_Loss(nn.Module):
         # Alignment loss
         loss_align = self.alignment(z_fmri, z_smri)
         
+        # Regression loss
+        loss_reg = self.regression(degeneration_preds, regression_targets)
+        
+        # Survival loss
+        loss_surv = self.survival(survival_shape, survival_scale, survival_times, survival_events)
+        
         # Total loss
         total_loss = (
             loss_class +
             self.lambda_kl * beta_annealing * loss_kl +
             self.lambda_align * loss_align +
-            self.lambda_recon * loss_recon
+            self.lambda_recon * loss_recon +
+            self.lambda_regression * loss_reg +
+            self.lambda_survival * loss_surv
         )
         
         return {
@@ -220,6 +291,8 @@ class MM_DBGDGM_Loss(nn.Module):
             'fmri_recon': recon_losses['fmri_recon'],
             'smri_recon': recon_losses['smri_recon'],
             'alignment': loss_align,
+            'regression': loss_reg,
+            'survival': loss_surv,
             'total': total_loss,
             'beta_annealing': torch.tensor(beta_annealing, device=logits.device)
         }
