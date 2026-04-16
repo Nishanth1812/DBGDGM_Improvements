@@ -30,6 +30,10 @@ from prepare_smri_jpg_dataset import build_dataset as build_smri_dataset
 CACHE_SOURCE_KIND = "prepared_smri_jpg"
 
 
+def _canonical_subject_key(value: Any) -> str:
+    return "".join(ch for ch in str(value).strip().casefold() if ch.isalnum())
+
+
 def _read_config(config_path: Path) -> Dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as config_file:
         return yaml.safe_load(config_file)
@@ -62,11 +66,21 @@ def _load_label_map(labels_csv_path: Path) -> Dict[str, int]:
     with labels_csv_path.open("r", newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
         for row in reader:
-            subject_id = str(row.get("subject_id", "")).strip()
+            subject_id = str(row.get("subject_id", row.get("Subject", row.get("PTID", row.get("RID", ""))))).strip()
             if not subject_id:
                 continue
-            label_value = int(row.get("label", 0))
+            raw_label = row.get("label", row.get("Label", row.get("diagnosis", row.get("Diagnosis", row.get("DX", 0)))))
+
+            try:
+                label_value = int(raw_label)
+            except Exception:
+                label_value = 0
+
             label_map[subject_id] = label_value
+
+            canonical_subject_id = _canonical_subject_key(subject_id)
+            if canonical_subject_id and canonical_subject_id not in label_map:
+                label_map[canonical_subject_id] = label_value
 
     return label_map
 

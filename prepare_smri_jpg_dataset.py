@@ -58,7 +58,9 @@ import shutil
 import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
 
 
 DEFAULT_CLASS_LABELS: List[Tuple[str, int]] = [
@@ -69,11 +71,20 @@ DEFAULT_CLASS_LABELS: List[Tuple[str, int]] = [
 ]
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+DICOM_EXTENSIONS = {".dcm", ".dicom", ".ima", ""}
 logger = logging.getLogger("smri-prep")
 
 
 def _normalize_folder_name(name: str) -> str:
     return " ".join(str(name).replace("_", " ").replace("-", " ").split()).casefold()
+
+
+def _canonical_subject_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().casefold())
+
+
+def _is_dicom_file(file_path: Path) -> bool:
+    return file_path.suffix.lower() in DICOM_EXTENSIONS
 
 
 def _resolve_class_dir(input_root: Path, class_name: str) -> Path | None:
@@ -175,8 +186,19 @@ def _load_label_map(labels_csv_path: Path | None, log: logging.Logger) -> Dict[s
             if label_text in stage_map:
                 label_map[subject_id] = stage_map[label_text]
 
+            canonical_subject_id = _canonical_subject_key(subject_id)
+            if canonical_subject_id and canonical_subject_id not in label_map:
+                label_map[canonical_subject_id] = label_map.get(subject_id, stage_map.get(label_text, 0))
+
     log.info(f"Loaded {len(label_map)} subject label(s) from {labels_csv_path}")
     return label_map
+
+
+def _lookup_subject_label(subject_id: str, label_map: Dict[str, int]) -> Optional[int]:
+    direct_label = label_map.get(subject_id)
+    if direct_label is not None:
+        return direct_label
+    return label_map.get(_canonical_subject_key(subject_id))
 
 
 def _class_name_for_label(label: int) -> str:
@@ -199,6 +221,98 @@ def _copy_subject_images(
         except Exception:
             destination = prepared_subject_dir / image_path.name
         _safe_transfer(image_path, destination, transfer_mode)
+
+
+def _collect_subject_media(subject_root: Path) -> List[Path]:
+    return sorted(
+        file_path
+        for file_path in subject_root.rglob("*")
+        if file_path.is_file() and (_is_image_file(file_path) or _is_dicom_file(file_path))
+    )
+
+
+def _load_subject_proxy_features(subject_root: Path, max_files: int = 120) -> Optional[np.ndarray]:
+    media_files = _collect_subject_media(subject_root)
+    if not media_files:
+        return None
+
+    media_files = media_files[:max_files]
+
+    slice_means: List[float] = []
+    slice_stds: List[float] = []
+    mins: List[float] = []
+    maxs: List[float] = []
+    row_values: List[float] = []
+    col_values: List[float] = []
+    file_sizes: List[float] = []
+
+    try:
+        import pydicom
+    except Exception:
+        pydicom = None
+
+    try:
+        import cv2
+    except Exception:
+        cv2 = None
+
+    for media_path in media_files:
+        pixels: Optional[np.ndarray] = None
+
+        if _is_dicom_file(media_path) and pydicom is not None:
+            try:
+                with pydicom.config.disable_value_validation():
+                    ds = pydicom.dcmread(str(media_path), force=True)
+                if hasattr(ds, "pixel_array"):
+                    pixels = ds.pixel_array.astype(np.float32)
+            except Exception:
+                pixels = None
+        elif cv2 is not None and _is_image_file(media_path):
+            try:
+                pixels = cv2.imread(str(media_path), cv2.IMREAD_UNCHANGED)
+                if pixels is not None and pixels.ndim == 3:
+                    pixels = cv2.cvtColor(pixels, cv2.COLOR_BGR2GRAY)
+                if pixels is not None:
+                    pixels = pixels.astype(np.float32)
+            except Exception:
+                pixels = None
+
+        if pixels is None or pixels.size == 0:
+            continue
+
+        slice_means.append(float(np.mean(pixels)))
+        slice_stds.append(float(np.std(pixels)))
+        mins.append(float(np.min(pixels)))
+        maxs.append(float(np.max(pixels)))
+        row_values.append(float(pixels.shape[0]))
+        col_values.append(float(pixels.shape[1] if pixels.ndim >= 2 else 1.0))
+        try:
+            file_sizes.append(float(media_path.stat().st_size))
+        except Exception:
+            file_sizes.append(0.0)
+
+    if not slice_means:
+        return None
+
+    mean_rows = float(np.mean(row_values)) if row_values else 0.0
+    mean_cols = float(np.mean(col_values)) if col_values else 0.0
+    aspect_ratio = float(mean_rows / max(mean_cols, 1.0))
+
+    features = np.asarray([
+        float(np.mean(slice_means)),
+        float(np.std(slice_means)),
+        float(np.mean(slice_stds)),
+        float(np.min(mins)),
+        float(np.max(maxs)),
+        mean_rows / 512.0,
+        mean_cols / 512.0,
+        aspect_ratio,
+        float(len(media_files)) / 100.0,
+        float(np.mean(file_sizes)) / 1_000_000.0 if file_sizes else 0.0,
+        float(np.std(file_sizes)) / 1_000_000.0 if file_sizes else 0.0,
+    ], dtype=np.float32)
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    return features
 
 
 def _infer_subject_id(image_path: Path) -> str:
@@ -380,10 +494,10 @@ def build_dataset(
         raw_groups: Dict[str, List[Path]] = defaultdict(list)
         raw_subject_roots: Dict[str, Path] = {}
 
-        for image_path in _collect_images(input_root):
-            subject_id = _extract_subject_id_from_path(image_path)
-            raw_groups[subject_id].append(image_path)
-            raw_subject_roots.setdefault(subject_id, _find_subject_root_from_path(image_path, input_root))
+        for media_path in _collect_subject_media(input_root):
+            subject_id = _extract_subject_id_from_path(media_path)
+            raw_groups[subject_id].append(media_path)
+            raw_subject_roots.setdefault(subject_id, _find_subject_root_from_path(media_path, input_root))
 
         if not raw_groups:
             raise FileNotFoundError(f"No image files were found under {input_root}")
@@ -394,31 +508,36 @@ def build_dataset(
         total_subjects = 0
 
         for subject_index, subject_id in enumerate(sorted(raw_groups), start=1):
-            subject_images = sorted(raw_groups[subject_id])
-            if not subject_images:
+            subject_media = sorted(raw_groups[subject_id])
+            if not subject_media:
                 continue
 
-            if subject_id not in label_map:
+            label = _lookup_subject_label(subject_id, label_map)
+            if label is None:
                 raise FileNotFoundError(
                     f"Missing label for subject_id={subject_id!r} in {labels_csv if labels_csv else 'labels CSV'}"
                 )
 
-            label = int(label_map[subject_id])
+            label = int(label)
             class_name = _class_name_for_label(label)
             subject_root = raw_subject_roots.get(subject_id, input_root)
             prepared_subject_dir = output_root / class_name / subject_id
             prepared_subject_dir.mkdir(parents=True, exist_ok=True)
 
-            _copy_subject_images(subject_images, subject_root, prepared_subject_dir, transfer_mode)
+            proxy_features = _load_subject_proxy_features(subject_root)
+            if proxy_features is None:
+                raise FileNotFoundError(f"Could not derive proxy features from subject root: {subject_root}")
 
-            image_count = len(subject_images)
+            np.save(prepared_subject_dir / "features.npy", proxy_features.astype(np.float32))
+
+            image_count = len(subject_media)
             total_images += image_count
             total_subjects += 1
 
             if total_subjects == 1 or total_subjects % 25 == 0:
                 log.info(
                     f"Prepared {total_subjects} raw ADNI subjects so far | subject='{subject_id}' | "
-                    f"label={label} ({class_name}) | images={image_count}"
+                    f"label={label} ({class_name}) | media_files={image_count} | features=features.npy"
                 )
 
             rows.append(
@@ -428,7 +547,7 @@ def build_dataset(
                     "label": label,
                     "image_count": image_count,
                     "source_folder": str(subject_root),
-                    "smri_path": str(prepared_subject_dir.relative_to(output_root)),
+                    "smri_path": str((prepared_subject_dir / "features.npy").relative_to(output_root)),
                     "prepared_folder": str(prepared_subject_dir.relative_to(output_root)),
                 }
             )
