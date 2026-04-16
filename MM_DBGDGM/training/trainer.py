@@ -177,7 +177,7 @@ class Trainer:
     def _clear_progress(self) -> None:
         self._set_progress('idle')
 
-    def _start_heartbeat(self, interval_seconds: float = 60.0) -> None:
+    def _start_heartbeat(self, interval_seconds: float = 30.0) -> None:
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             return
 
@@ -259,6 +259,12 @@ class Trainer:
         for batch_idx, batch in enumerate(train_loader):
             batch_number = batch_idx + 1
             batch_start = time.perf_counter()
+
+            if batch_number == 1:
+                logger.info(
+                    f"Epoch {epoch_number}: beginning batch loop; batch 1 is loading and may take a while "
+                    f"before the first loss log appears"
+                )
 
             self._set_progress(
                 phase='train_prepare',
@@ -376,6 +382,12 @@ class Trainer:
         
         for batch_idx, batch in enumerate(val_loader):
             batch_number = batch_idx + 1
+
+            if batch_number == 1:
+                logger.info(
+                    f"Epoch {epoch_number}: beginning validation batch loop; batch 1 is loading"
+                )
+
             self._set_progress(
                 phase='val_prepare',
                 epoch=epoch_number,
@@ -483,6 +495,10 @@ class Trainer:
 
         for batch_idx, batch in enumerate(test_loader):
             batch_number = batch_idx + 1
+
+            if batch_number == 1:
+                logger.info("Testing: beginning batch loop; batch 1 is loading")
+
             self._set_progress(
                 phase='test_prepare',
                 epoch=None,
@@ -662,6 +678,7 @@ class Trainer:
         
         training_start = time.perf_counter()
         self._start_heartbeat()
+        logger.info("Heartbeat progress updates will appear every 30 seconds while a batch is active")
         try:
             # Training loop
             for epoch in range(start_epoch, num_epochs):
