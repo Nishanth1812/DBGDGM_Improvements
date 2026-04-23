@@ -42,8 +42,17 @@ MODEL_DIR = ROOT_DIR / "best_model"
 
 GDRIVE_FOLDER_ID = "1Qx3jqL_eSxGfWvhxb20M6orxvKsQlQT9"
 
-# Common fMRI clue tokens from dataset.py
-FMRI_CLUE_TOKENS = ("fmri", "bold", "rest", "rsfmri", "ep2d", "epi")
+# fMRI clues: common ADNI and OASIS strings for functional/BOLD sequences
+FMRI_CLUE_TOKENS = (
+    "fmri", "bold", "rest", "rsfmri", "ep2d", "epi", 
+    "functional", "asl", "pcasl", "resting"
+)
+
+# sMRI clues: common strings for structural/T1 sequences
+SMRI_CLUE_TOKENS = (
+    "mprage", "t1", "structural", "spgr", "t1w", 
+    "bravo", "axial", "sagittal", "coronal"
+)
 
 def ensure_dirs():
     for d in [RAW_DIR, EXTRACT_DIR, PROCESSED_DIR, MODEL_DIR]:
@@ -74,10 +83,11 @@ def extract_zip(zip_path: Path, target_dir: Path):
         logger.error(f"Failed to extract {zip_path.name}: {e}")
 
 def get_subject_id(path: Path) -> str:
-    """Extract ADNI subject ID (NNN_S_NNNN) from a path."""
-    adni_match = re.search(r"(\d{3}_S_\d{4})", str(path))
-    if adni_match:
-        return adni_match.group(1)
+    """Extract ADNI subject ID (NNN_S_NNNN) from path components or name."""
+    # Match standard ADNI patterns: 002_S_0295 or 002-S-0295
+    match = re.search(r"(\d{3})[_.-]S[_.-](\d{4})", str(path))
+    if match:
+        return f"{match.group(1)}_S_{match.group(2)}"
     return ""
 
 def is_fmri(path: Path) -> bool:
@@ -118,10 +128,14 @@ def preprocess_and_match():
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 executor.map(lambda z: extract_zip(z, EXTRACT_DIR), zip_files)
 
-    fmri_map: Dict[str, List[Path]] = {}
-    smri_map: Dict[str, List[Path]] = {}
-
-    # Look for leaf directories that actually contain files
+    fmri_map = {}
+    smri_map = {}
+    
+    # We scan the EXTRACT_DIR for leaf folders containing files
+    # ADNI structure is usually: EXTRACT_DIR/Subject/Protocol/Date_Time/Series/Files
+    print(f"Scanning {EXTRACT_DIR} for ADNI subjects...")
+    
+    found_folders = 0
     for root, dirs, files in os.walk(EXTRACT_DIR):
         if not files:
             continue
@@ -131,22 +145,42 @@ def preprocess_and_match():
         if not subj_id:
             continue
             
-        # We prefer "leaf" directories that contain actual data files (DICOMs, npy, etc)
-        if is_fmri(root_path):
-            # If we already have a path for this subject, prefer deeper ones or just keep them
+        found_folders += 1
+        path_lower = str(root_path).lower()
+        
+        # Decide if this is fMRI or sMRI based on path tokens
+        is_f = any(token in path_lower for token in FMRI_CLUE_TOKENS)
+        is_s = any(token in path_lower for token in SMRI_CLUE_TOKENS)
+        
+        if is_f and not is_s:
+            fmri_map.setdefault(subj_id, []).append(root_path)
+        elif is_s and not is_f:
+            smri_map.setdefault(subj_id, []).append(root_path)
+        elif is_f and is_s:
+            # If it has both (e.g. "BOLD_T1_Reference"), default to fMRI for BOLD
             fmri_map.setdefault(subj_id, []).append(root_path)
         else:
-            smri_map.setdefault(subj_id, []).append(root_path)
+            # Ambiguous - if it has many files, it's likely fMRI (timepoints)
+            if len(files) > 50:
+                fmri_map.setdefault(subj_id, []).append(root_path)
+            else:
+                smri_map.setdefault(subj_id, []).append(root_path)
 
-    common_subjects = set(fmri_map.keys()) & set(smri_map.keys())
-    logger.info(f"Total subjects: {len(set(fmri_map.keys()) | set(smri_map.keys()))}")
-    logger.info(f"fMRI subjects: {len(fmri_map)}")
-    logger.info(f"sMRI subjects: {len(smri_map)}")
-    logger.info(f"Matched subjects: {len(common_subjects)}")
-
+    common_subjects = sorted(list(set(fmri_map.keys()) & set(smri_map.keys())))
+    print(f"Match Summary:")
+    print(f"  - Total subject folders scanned: {found_folders}")
+    print(f"  - Subjects with fMRI: {len(fmri_map)}")
+    print(f"  - Subjects with sMRI: {len(smri_map)}")
+    print(f"  - Perfectly paired subjects: {len(common_subjects)}")
+    
     if not common_subjects:
-        logger.error("No subjects found with both fMRI and sMRI!")
+        print("ERROR: No paired fMRI/sMRI subjects found! Check if your zip files contain both modalities.")
+        if fmri_map: print(f"Sample fMRI subject: {list(fmri_map.keys())[0]}")
+        if smri_map: print(f"Sample sMRI subject: {list(smri_map.keys())[0]}")
         return False
+
+    print(f"Preparing data for {len(common_subjects)} paired subjects...")
+    logger.info(f"Matched subjects: {len(common_subjects)}")
 
     # Organize into PROCESSED_DIR
     logger.info(f"Moving {len(common_subjects)} matched subjects to {PROCESSED_DIR}")
