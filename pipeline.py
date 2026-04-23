@@ -95,16 +95,25 @@ def is_fmri(path: Path) -> bool:
 def preprocess_and_match():
     logger.info("Preprocessing and matching subjects...")
     
+    # Check if PROCESSED_DIR already has matched data to skip work
+    if (PROCESSED_DIR / "fmri").exists() and (PROCESSED_DIR / "smri").exists() and (PROCESSED_DIR / "labels.csv").exists():
+        logger.info(f"Processed data already exists in {PROCESSED_DIR}. Skipping extraction and matching.")
+        return True
+
     zip_files = list(RAW_DIR.glob("*.zip"))
     if not zip_files:
         logger.warning(f"No zip files found in {RAW_DIR}. Checking if data already exists in {EXTRACT_DIR}...")
-        if not any(EXTRACT_DIR.iterdir()):
+        if not EXTRACT_DIR.exists() or not any(EXTRACT_DIR.iterdir()):
             logger.error("No data found to preprocess!")
             return False
     else:
-        logger.info(f"Found {len(zip_files)} zip files. Extracting...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            executor.map(lambda z: extract_zip(z, EXTRACT_DIR), zip_files)
+        # Check if we already have extracted content to avoid re-extracting
+        if any(EXTRACT_DIR.iterdir()):
+            logger.info(f"Extraction directory {EXTRACT_DIR} is not empty. Skipping re-extraction of zips.")
+        else:
+            logger.info(f"Found {len(zip_files)} zip files. Extracting...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                executor.map(lambda z: extract_zip(z, EXTRACT_DIR), zip_files)
 
     fmri_map: Dict[str, List[Path]] = {}
     smri_map: Dict[str, List[Path]] = {}
@@ -248,10 +257,8 @@ def main():
 
     if run_training():
         logger.info("Pipeline executed successfully.")
-        # Cleanup extracted data to save space, but keep processed data
-        if EXTRACT_DIR.exists():
-            shutil.rmtree(EXTRACT_DIR)
-            logger.info("Cleaned up temporary extraction directory.")
+        # We no longer automatically delete EXTRACT_DIR as requested by the user.
+        # This allows for manual inspection and avoids re-extraction on subsequent runs.
     else:
         logger.error("Pipeline failed during training.")
 
