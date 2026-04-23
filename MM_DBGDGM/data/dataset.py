@@ -834,7 +834,10 @@ class MultimodalBrainDataset(Dataset):
         if 'fmri' in self.modalities:
             fmri_source, fmri_strategy = self._resolve_fmri_source_with_strategy(sample)
             resolution['fmri'] = fmri_strategy
-            if fmri_source is None or not fmri_source.exists():
+            if fmri_source is None:
+                missing.append('fmri')
+            elif not fmri_source.exists():
+                logger.warning(f"fMRI path resolved but does not exist: {fmri_source}")
                 missing.append('fmri')
 
         if 'smri' in self.modalities:
@@ -847,14 +850,16 @@ class MultimodalBrainDataset(Dataset):
                 # This prevents subjects from slipping through the filter only to fail at runtime
                 smri_loadable = False
                 if smri_source.is_file():
-                    smri_loadable = True  # .npy files are always loadable if they exist
+                    smri_loadable = True
                 elif smri_source.is_dir():
                     # Try image files first, then DICOM
-                    has_images = any(
-                        True for p in smri_source.rglob('*')
+                    matching_files = [
+                        p for p in smri_source.rglob('*')
                         if p.is_file() and (_is_image_file(p) or _is_dicom_file(p))
-                    )
-                    smri_loadable = has_images
+                    ]
+                    smri_loadable = len(matching_files) > 0
+                    if not smri_loadable:
+                        logger.warning(f"sMRI folder found but contains no recognizable images/DICOMs: {smri_source}")
                 resolution['smri'] = 'exact' if smri_loadable else 'missing'
                 if not smri_loadable:
                     missing.append('smri')
