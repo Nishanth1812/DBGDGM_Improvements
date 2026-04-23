@@ -88,10 +88,20 @@ def is_fmri(path: Path) -> bool:
 def preprocess_and_match():
     logger.info("Preprocessing and matching subjects...")
     
-    # Check if PROCESSED_DIR already has matched data to skip work
-    if (PROCESSED_DIR / "fmri").exists() and (PROCESSED_DIR / "smri").exists() and (PROCESSED_DIR / "labels.csv").exists():
-        logger.info(f"Processed data already exists in {PROCESSED_DIR}. Skipping extraction and matching.")
-        return True
+    # Check if PROCESSED_DIR already has matched data AND a valid labels.csv with explicit paths
+    labels_csv = PROCESSED_DIR / "labels.csv"
+    if (PROCESSED_DIR / "fmri").exists() and (PROCESSED_DIR / "smri").exists() and labels_csv.exists():
+        import pandas as pd
+        try:
+            df = pd.read_csv(labels_csv)
+            if 'fmri_path' in df.columns and 'smri_path' in df.columns and len(df) > 0:
+                logger.info(f"Valid labels.csv with explicit paths exists ({len(df)} subjects). Skipping extraction and matching.")
+                return True
+            else:
+                logger.info("labels.csv exists but lacks explicit paths. Regenerating...")
+                labels_csv.unlink()
+        except Exception:
+            labels_csv.unlink(missing_ok=True)
 
     zip_files = list(RAW_DIR.glob("*.zip"))
     if not zip_files:
@@ -163,24 +173,24 @@ def preprocess_and_match():
 
     # Generate labels.csv with EXPLICIT paths so the dataset loader never has to guess
     labels_csv = PROCESSED_DIR / "labels.csv"
-    if not labels_csv.exists():
-        logger.info("Creating labels.csv with explicit modality paths...")
-        import pandas as pd
-        data = []
-        for subj_id in common_subjects:
-            fmri_path = PROCESSED_DIR / "fmri" / subj_id
-            smri_path = PROCESSED_DIR / "smri" / subj_id
-            # Only include subjects where both folders were actually created
-            if fmri_path.exists() and smri_path.exists():
-                data.append({
-                    "subject_id": subj_id,
-                    "timepoint": "T0",
-                    "label": 0,
-                    "fmri_path": str(fmri_path),
-                    "smri_path": str(smri_path),
-                })
-        pd.DataFrame(data).to_csv(labels_csv, index=False)
-        logger.info(f"Created {labels_csv} with {len(data)} entries (explicit paths).")
+    # Always regenerate to ensure paths are up to date
+    logger.info("Creating labels.csv with explicit modality paths...")
+    import pandas as pd
+    data = []
+    for subj_id in common_subjects:
+        fmri_path = PROCESSED_DIR / "fmri" / subj_id
+        smri_path = PROCESSED_DIR / "smri" / subj_id
+        # Only include subjects where both folders were actually created
+        if fmri_path.exists() and smri_path.exists():
+            data.append({
+                "subject_id": subj_id,
+                "timepoint": "T0",
+                "label": 0,
+                "fmri_path": str(fmri_path),
+                "smri_path": str(smri_path),
+            })
+    pd.DataFrame(data).to_csv(labels_csv, index=False)
+    logger.info(f"Created {labels_csv} with {len(data)} entries (explicit paths).")
 
     return True
 
