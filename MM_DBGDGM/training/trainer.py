@@ -14,12 +14,14 @@ from pathlib import Path
 from typing import Dict, Optional, Any, List, Set
 import logging
 import json
+import shutil
 from datetime import datetime
 from collections import defaultdict
+from tqdm import tqdm
 
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 
-logger = logging.getLogger("mm-dbgdgm-modal")
+logger = logging.getLogger("mm-dbgdgm")
 
 
 class Trainer:
@@ -254,9 +256,9 @@ class Trainer:
         epoch_number = epoch + 1
         total_batches = len(train_loader)
 
-        logger.info(f"Epoch {epoch_number}: training started with {total_batches} batches")
-        
-        for batch_idx, batch in enumerate(train_loader):
+        # Log progress
+        pbar = tqdm(enumerate(train_loader), total=total_batches, desc=f"Epoch {epoch_number} [Train]", leave=False)
+        for batch_idx, batch in pbar:
             batch_number = batch_idx + 1
             batch_start = time.perf_counter()
 
@@ -328,7 +330,13 @@ class Trainer:
             
             num_batches += 1
             
-            # Log progress
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{total_loss.item():.4f}",
+                'acc': f"{acc.item():.4f}"
+            })
+
+            # Log progress to file periodically
             if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
                 logger.info(
                     f"Epoch {epoch_number}: batch {batch_number}/{total_batches} done in {step_done - batch_start:.1f}s "
@@ -336,6 +344,7 @@ class Trainer:
                     f"backward {step_done - forward_done:.1f}s) | Loss: {total_loss.item():.4f} | Acc: {acc.item():.4f}" \
                     f"{self._gpu_memory_summary()}"
                 )
+
 
         if num_batches == 0:
             raise ValueError(
@@ -435,6 +444,12 @@ class Trainer:
             preds = outputs['predictions']
             acc = (preds == targets).float().mean()
             metrics['val_accuracy'] += acc.detach()
+
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss_dict['total'].item():.4f}",
+                'acc': f"{acc.item():.4f}"
+            })
 
             if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
                 logger.info(
@@ -609,10 +624,46 @@ class Trainer:
             f"Weighted F1: {results['weighted_f1']:.4f}"
         )
 
+        # Export inference samples if this is a test run
+        self.export_inference_samples(test_loader, num_samples=10)
+
         self._clear_progress()
 
         results['results_path'] = str(results_path)
         return results
+    
+    def export_inference_samples(self, loader: DataLoader, num_samples: int = 10):
+        """Export a few samples from the loader for inference testing."""
+        inference_dir = self.output_dir / 'inference_samples'
+        inference_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Exporting {num_samples} inference samples to {inference_dir}")
+        
+        count = 0
+        for batch in loader:
+            fmri = batch['fmri']
+            smri = batch['smri']
+            labels = batch['label']
+            
+            for i in range(fmri.size(0)):
+                if count >= num_samples:
+                    return
+                
+                sample_id = batch.get('subject_id', [f"sample_{count}"])[i]
+                timepoint = batch.get('timepoint', ["T0"])[i]
+                
+                sample_path = inference_dir / f"{sample_id}_{timepoint}"
+                sample_path.mkdir(parents=True, exist_ok=True)
+                
+                np.save(sample_path / 'fmri.npy', fmri[i].numpy())
+                np.save(sample_path / 'smri.npy', smri[i].numpy())
+                
+                # Save label as well
+                with open(sample_path / 'label.txt', 'w') as f:
+                    f.write(str(labels[i].item()))
+                
+                count += 1
+
     
     def fit(
         self,
@@ -825,6 +876,15 @@ class Trainer:
         
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+        # Clean up: If this is the best model, ensure only best_model.pt remains in the folder
+        if name == 'best_model':
+            for other_pt in self.output_dir.glob("*.pt"):
+                if other_pt.name != 'best_model.pt':
+                    try:
+                        other_pt.unlink()
+                    except Exception:
+                        pass
     
     def _save_history(self):
         """Save training history."""
