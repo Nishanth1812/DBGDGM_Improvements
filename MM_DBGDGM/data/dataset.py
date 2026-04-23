@@ -20,6 +20,9 @@ from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
 
+# Global cache to prevent redundant folder scanning across Train/Val/Test datasets
+_MODALITY_SOURCE_CACHE: Dict[str, Any] = {}
+
 IMAGE_FILE_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -323,11 +326,9 @@ def _load_dicom_folder_proxy_features(series_dir: Path, target_len: Optional[int
         logger.error("ACTION REQUIRED: Run 'pip install pydicom' on your VM.")
         return None
 
-    dicom_files = sorted(
-        path for path in series_dir.rglob('*')
-        if path.is_file() and _is_dicom_file(path)
-    )
-    if not dicom_files:
+    # Use all files that aren't obviously non-medical
+    all_files = sorted(path for path in series_dir.rglob('*') if path.is_file())
+    if not all_files:
         return None
 
     image_means: List[float] = []
@@ -338,8 +339,13 @@ def _load_dicom_folder_proxy_features(series_dir: Path, target_len: Optional[int
     col_values: List[float] = []
     file_sizes: List[float] = []
 
-    for dcm_path in dicom_files:
+    for dcm_path in all_files:
+        # Skip files that are likely not DICOM (based on extension if present)
+        if dcm_path.suffix.lower() in {".txt", ".csv", ".json", ".xml", ".pdf"}:
+            continue
+            
         try:
+            # force=True allows reading files without the 'DICM' prefix
             ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=False, force=True)
             if not hasattr(ds, 'pixel_array'):
                 continue
@@ -869,6 +875,15 @@ class MultimodalBrainDataset(Dataset):
         if not self.samples:
             return
 
+        # Use cache key based on dataset root to allow sharing across Train/Val/Test
+        cache_key = hashlib.md5(str(self.dataset_root).encode()).hexdigest()
+        if cache_key in _MODALITY_SOURCE_CACHE:
+            cached_samples, cached_stats = _MODALITY_SOURCE_CACHE[cache_key]
+            self.samples = cached_samples
+            self._pairing_stats.update(cached_stats)
+            logger.info(f"Using cached pairing summary ({len(self.samples)} samples kept)")
+            return
+
         kept_samples: List[Dict[str, Any]] = []
         dropped: List[Tuple[str, str, str]] = []
 
@@ -919,6 +934,7 @@ class MultimodalBrainDataset(Dataset):
             )
 
         self.samples = kept_samples
+        _MODALITY_SOURCE_CACHE[cache_key] = (kept_samples, self._pairing_stats.copy())
 
         logger.info(
             "Pairing summary | "
