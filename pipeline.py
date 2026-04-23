@@ -161,16 +161,26 @@ def preprocess_and_match():
         except Exception as e:
             logger.warning(f"Could not copy data for {subj_id}: {e}")
 
-    # Generate labels.csv
+    # Generate labels.csv with EXPLICIT paths so the dataset loader never has to guess
     labels_csv = PROCESSED_DIR / "labels.csv"
     if not labels_csv.exists():
-        logger.info("Creating placeholder labels.csv...")
+        logger.info("Creating labels.csv with explicit modality paths...")
         import pandas as pd
         data = []
         for subj_id in common_subjects:
-            data.append({"subject_id": subj_id, "timepoint": "T0", "label": 0})
+            fmri_path = PROCESSED_DIR / "fmri" / subj_id
+            smri_path = PROCESSED_DIR / "smri" / subj_id
+            # Only include subjects where both folders were actually created
+            if fmri_path.exists() and smri_path.exists():
+                data.append({
+                    "subject_id": subj_id,
+                    "timepoint": "T0",
+                    "label": 0,
+                    "fmri_path": str(fmri_path),
+                    "smri_path": str(smri_path),
+                })
         pd.DataFrame(data).to_csv(labels_csv, index=False)
-        logger.info(f"Created {labels_csv} with {len(data)} entries.")
+        logger.info(f"Created {labels_csv} with {len(data)} entries (explicit paths).")
 
     return True
 
