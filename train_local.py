@@ -636,18 +636,25 @@ def main() -> Dict[str, Any]:
             args.metadata_file if args.metadata_file is not None else data_cfg.get("metadata_file"),
             path_base_dir,
         )
-        train_metadata = _resolve_optional_path(
-            args.train_metadata if args.train_metadata is not None else data_cfg.get("train_metadata"),
-            path_base_dir,
-        )
-        val_metadata = _resolve_optional_path(
-            args.val_metadata if args.val_metadata is not None else data_cfg.get("val_metadata"),
-            path_base_dir,
-        )
-        test_metadata = _resolve_optional_path(
-            args.test_metadata if args.test_metadata is not None else data_cfg.get("test_metadata"),
-            path_base_dir,
-        )
+        
+        # If we have a single metadata file for auto-splitting, ignore the individual split paths
+        if metadata_file is not None:
+            train_metadata = None
+            val_metadata = None
+            test_metadata = None
+        else:
+            train_metadata = _resolve_optional_path(
+                args.train_metadata if args.train_metadata is not None else data_cfg.get("train_metadata"),
+                path_base_dir,
+            )
+            val_metadata = _resolve_optional_path(
+                args.val_metadata if args.val_metadata is not None else data_cfg.get("val_metadata"),
+                path_base_dir,
+            )
+            test_metadata = _resolve_optional_path(
+                args.test_metadata if args.test_metadata is not None else data_cfg.get("test_metadata"),
+                path_base_dir,
+            )
         smri_source_root = _resolve_optional_path(
             args.smri_source_root if args.smri_source_root is not None else data_cfg.get("smri_source_root"),
             path_base_dir,

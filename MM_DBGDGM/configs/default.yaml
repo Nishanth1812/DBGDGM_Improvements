@@ -3,10 +3,10 @@
 # Data configuration
 data:
   dataset_root: '/path/to/preprocessed_data'  # Root directory with fmri/ and smri/ subdirs
-  metadata_file: ''  # Optional single CSV manifest; when set, the loader auto-splits train/val/test
-  train_metadata: '/path/to/train_metadata.csv'  # CSV: subject_id, timepoint, label
-  val_metadata: '/path/to/val_metadata.csv'
-  test_metadata: '/path/to/test_metadata.csv'  # Optional
+  metadata_file: ''
+  train_metadata: ''
+  val_metadata: ''
+  test_metadata: ''
   smri_source_root: ''  # Optional local prepared SMRI JPG root; supports prepared_folder / smri_path columns
   fmri_path_column: 'fmri_path'  # Optional explicit path column in the manifest
   smri_path_column: 'smri_path'  # Optional explicit path column in the manifest
