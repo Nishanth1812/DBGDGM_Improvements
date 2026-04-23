@@ -103,7 +103,7 @@ def setup_logging(output_dir: Path) -> logging.Logger:
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
 
-        trainer_logger = logging.getLogger("mm-dbgdgm-modal")
+        trainer_logger = logging.getLogger("mm-dbgdgm")
         trainer_logger.setLevel(logging.INFO)
         trainer_logger.propagate = False
         trainer_logger.addHandler(file_handler)
@@ -145,7 +145,14 @@ def detect_device(preferred_device: str, logger: logging.Logger) -> torch.device
                 torch.backends.cudnn.allow_tf32 = True
                 if hasattr(torch, "set_float32_matmul_precision"):
                     torch.set_float32_matmul_precision("high")
-                logger.info("Enabled CUDA TF32 and high matmul precision")
+                
+                # ROCm specific optimizations if detected
+                if hip_version:
+                    # AMD GPUs benefit from specific env vars
+                    os.environ["PYTORCH_ROCM_ARCH"] = "gfx942" # Default for MI300X
+                    os.environ["MIOPEN_DEBUG_CONV_GEMM"] = "0"
+                
+                logger.info("Enabled performance flags for high-spec GPU")
             except Exception as exc:
                 logger.warning(f"Could not enable CUDA performance flags: {exc}")
 
@@ -648,8 +655,8 @@ def main() -> Dict[str, Any]:
     resume_checkpoint = _resolve_optional_path(args.resume_from, path_base_dir)
     pretrained_fmri_checkpoint = _resolve_optional_path(args.pretrained_fmri_checkpoint, path_base_dir)
 
-    batch_size = int(_coalesce(args.batch_size, training_cfg.get("batch_size"), data_cfg.get("batch_size"), default=16))
-    num_workers = int(_coalesce(args.num_workers, training_cfg.get("num_workers"), data_cfg.get("num_workers"), default=4))
+    batch_size = int(_coalesce(args.batch_size, training_cfg.get("batch_size"), data_cfg.get("batch_size"), default=64))
+    num_workers = int(_coalesce(args.num_workers, training_cfg.get("num_workers"), data_cfg.get("num_workers"), default=20))
     num_epochs = int(_coalesce(args.num_epochs, training_cfg.get("num_epochs"), default=50))
     learning_rate = float(_coalesce(training_cfg.get("learning_rate"), default=1e-4))
     weight_decay = float(_coalesce(training_cfg.get("weight_decay"), default=1e-5))
