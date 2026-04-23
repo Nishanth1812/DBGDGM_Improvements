@@ -171,16 +171,16 @@ def preprocess_and_match():
         except Exception as e:
             logger.warning(f"Could not copy data for {subj_id}: {e}")
 
-    # Generate labels.csv with EXPLICIT paths so the dataset loader never has to guess
+    # Generate labels.csv with EXPLICIT absolute paths
     labels_csv = PROCESSED_DIR / "labels.csv"
-    # Always regenerate to ensure paths are up to date
     logger.info("Creating labels.csv with explicit modality paths...")
     import pandas as pd
     data = []
     for subj_id in common_subjects:
-        fmri_path = PROCESSED_DIR / "fmri" / subj_id
-        smri_path = PROCESSED_DIR / "smri" / subj_id
-        # Only include subjects where both folders were actually created
+        # Use absolute paths to be 100% sure the loader finds them
+        fmri_path = (PROCESSED_DIR / "fmri" / subj_id).resolve()
+        smri_path = (PROCESSED_DIR / "smri" / subj_id).resolve()
+        
         if fmri_path.exists() and smri_path.exists():
             data.append({
                 "subject_id": subj_id,
@@ -189,8 +189,13 @@ def preprocess_and_match():
                 "fmri_path": str(fmri_path),
                 "smri_path": str(smri_path),
             })
+    
+    if not data:
+        logger.error("No valid subject folders found in data/processed! Matching might have failed.")
+        return False
+        
     pd.DataFrame(data).to_csv(labels_csv, index=False)
-    logger.info(f"Created {labels_csv} with {len(data)} entries (explicit paths).")
+    logger.info(f"Created {labels_csv} with {len(data)} entries (explicit absolute paths).")
 
     return True
 

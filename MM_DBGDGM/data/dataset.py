@@ -886,10 +886,16 @@ class MultimodalBrainDataset(Dataset):
                 self._pairing_stats['smri_missing'] += 1
 
             if missing:
+                reasons = []
+                if 'fmri' in missing:
+                    reasons.append(f"missing fMRI: {resolution.get('fmri', 'missing')}")
+                if 'smri' in missing:
+                    reasons.append(f"missing sMRI: {resolution.get('smri', 'missing')}")
+                
                 dropped.append((
                     _string_or_empty(sample.get('subject_id')),
                     _string_or_empty(sample.get('timepoint')),
-                    ",".join(missing),
+                    " & ".join(reasons),
                 ))
                 self._pairing_stats['dropped_samples'] += 1
                 continue
@@ -898,8 +904,8 @@ class MultimodalBrainDataset(Dataset):
 
         if dropped:
             preview = "; ".join(
-                f"{subject_id or '<empty-subject>'}:{timepoint or '<empty-timepoint>'} [{missing}]"
-                for subject_id, timepoint, missing in dropped[:8]
+                f"{subject_id or '<empty-subject>'}:{timepoint or '<empty-timepoint>'} ({reason})"
+                for subject_id, timepoint, reason in dropped[:8]
             )
             if len(dropped) > 8:
                 preview = f"{preview}; ... (+{len(dropped) - 8} more)"
