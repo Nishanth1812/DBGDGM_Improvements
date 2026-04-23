@@ -746,9 +746,18 @@ class MultimodalBrainDataset(Dataset):
 
             subject_dir = root / subject_id
             if subject_dir.exists():
+                # Check for preprocessed arrays
                 nested_matches = sorted(subject_dir.rglob('fmri_windows_dbgdgm.npy'))
                 if nested_matches:
                     return nested_matches[0], 'exact'
+                
+                # Check for raw DICOMs
+                dicom_dirs = sorted({
+                    path.parent for path in subject_dir.rglob('*') 
+                    if path.is_file() and _is_dicom_file(path)
+                })
+                if dicom_dirs:
+                    return dicom_dirs[0], 'exact'
 
         raw_series_candidates = self._dicom_series_index.get(subject_id, [])
         if raw_series_candidates:

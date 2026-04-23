@@ -118,23 +118,21 @@ def preprocess_and_match():
     fmri_map: Dict[str, List[Path]] = {}
     smri_map: Dict[str, List[Path]] = {}
 
-    logger.info("Scanning extracted files for subject modalities...")
-    # Look for leaf-ish directories that contain data
+    # Look for leaf directories that actually contain files
     for root, dirs, files in os.walk(EXTRACT_DIR):
-        root_path = Path(root)
-        
-        # Skip empty directories
-        if not files and not dirs:
+        if not files:
             continue
             
+        root_path = Path(root)
         subj_id = get_subject_id(root_path)
         if not subj_id:
             continue
             
+        # We prefer "leaf" directories that contain actual data files (DICOMs, npy, etc)
         if is_fmri(root_path):
+            # If we already have a path for this subject, prefer deeper ones or just keep them
             fmri_map.setdefault(subj_id, []).append(root_path)
         else:
-            # Assume it's sMRI if it has DICOMs/Images or is named sMRI
             smri_map.setdefault(subj_id, []).append(root_path)
 
     common_subjects = set(fmri_map.keys()) & set(smri_map.keys())
@@ -161,14 +159,14 @@ def preprocess_and_match():
         target_fmri.parent.mkdir(parents=True, exist_ok=True)
         target_smri.parent.mkdir(parents=True, exist_ok=True)
         
-        # We use move to save space
+        # We use copy to keep the extracted folder intact as requested
         try:
             if not target_fmri.exists():
-                shutil.move(str(fmri_map[subj_id][0]), str(target_fmri))
+                shutil.copytree(str(fmri_map[subj_id][0]), str(target_fmri))
             if not target_smri.exists():
-                shutil.move(str(smri_map[subj_id][0]), str(target_smri))
+                shutil.copytree(str(smri_map[subj_id][0]), str(target_smri))
         except Exception as e:
-            logger.warning(f"Could not move data for {subj_id}: {e}")
+            logger.warning(f"Could not copy data for {subj_id}: {e}")
 
     # Generate labels.csv
     labels_csv = PROCESSED_DIR / "labels.csv"
@@ -243,7 +241,17 @@ def main():
     parser = argparse.ArgumentParser(description="MM-DBGDGM Automated Pipeline")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-preprocess", action="store_true")
+    parser.add_argument("--force", action="store_true", help="Force re-extraction and matching by clearing old data")
     args = parser.parse_args()
+
+    if args.force:
+        logger.info("Force flag detected. Clearing extracted and processed directories...")
+        if EXTRACT_DIR.exists():
+            shutil.rmtree(EXTRACT_DIR)
+        if PROCESSED_DIR.exists():
+            shutil.rmtree(PROCESSED_DIR)
+        if MODEL_DIR.exists():
+            shutil.rmtree(MODEL_DIR)
 
     ensure_dirs()
 
