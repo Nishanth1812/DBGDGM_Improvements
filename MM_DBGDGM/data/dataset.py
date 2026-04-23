@@ -319,6 +319,8 @@ def _load_dicom_folder_proxy_features(series_dir: Path, target_len: Optional[int
     try:
         import pydicom
     except ImportError:
+        logger.error("CRITICAL: 'pydicom' is not installed. Raw DICOM sMRI data cannot be processed.")
+        logger.error("ACTION REQUIRED: Run 'pip install pydicom' on your VM.")
         return None
 
     dicom_files = sorted(
@@ -852,14 +854,11 @@ class MultimodalBrainDataset(Dataset):
                 if smri_source.is_file():
                     smri_loadable = True
                 elif smri_source.is_dir():
-                    # Try image files first, then DICOM
-                    matching_files = [
-                        p for p in smri_source.rglob('*')
-                        if p.is_file() and (_is_image_file(p) or _is_dicom_file(p))
-                    ]
-                    smri_loadable = len(matching_files) > 0
+                    # Relaxed check: just verify the folder actually has files
+                    has_any_files = any(True for p in smri_source.iterdir() if p.is_file())
+                    smri_loadable = has_any_files
                     if not smri_loadable:
-                        logger.warning(f"sMRI folder found but contains no recognizable images/DICOMs: {smri_source}")
+                        logger.warning(f"sMRI folder is empty or has no files: {smri_source}")
                 resolution['smri'] = 'exact' if smri_loadable else 'missing'
                 if not smri_loadable:
                     missing.append('smri')
