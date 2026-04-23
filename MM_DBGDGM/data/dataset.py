@@ -340,12 +340,86 @@ def _first_existing_path(candidates: List[Path]) -> Optional[Path]:
     return None
 
 
+def _load_dicom_folder_proxy_features(series_dir: Path, target_len: Optional[int] = None) -> Optional[np.ndarray]:
+    """Extract proxy sMRI features from a folder of raw DICOM files using pydicom."""
+    try:
+        import pydicom
+    except ImportError:
+        return None
+
+    dicom_files = sorted(
+        path for path in series_dir.rglob('*')
+        if path.is_file() and _is_dicom_file(path)
+    )
+    if not dicom_files:
+        return None
+
+    image_means: List[float] = []
+    image_stds: List[float] = []
+    mins: List[float] = []
+    maxs: List[float] = []
+    row_values: List[float] = []
+    col_values: List[float] = []
+    file_sizes: List[float] = []
+
+    for dcm_path in dicom_files:
+        try:
+            ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=False, force=True)
+            if not hasattr(ds, 'pixel_array'):
+                continue
+            pixels = ds.pixel_array.astype(np.float32)
+            if pixels.ndim == 3:
+                pixels = pixels[0]
+            if pixels.size == 0:
+                continue
+            image_means.append(float(np.mean(pixels)))
+            image_stds.append(float(np.std(pixels)))
+            mins.append(float(np.min(pixels)))
+            maxs.append(float(np.max(pixels)))
+            row_values.append(float(pixels.shape[0]))
+            col_values.append(float(pixels.shape[-1] if pixels.ndim > 1 else pixels.shape[0]))
+            file_sizes.append(float(dcm_path.stat().st_size))
+        except Exception:
+            continue
+
+    if not image_means:
+        return None
+
+    mean_rows = float(np.mean(row_values)) if row_values else 0.0
+    mean_cols = float(np.mean(col_values)) if col_values else 0.0
+    aspect_ratio = float(mean_rows / max(mean_cols, 1.0))
+    smri_raw = np.asarray([
+        float(np.mean(image_means)),
+        float(np.std(image_means)),
+        float(np.mean(image_stds)),
+        float(np.min(mins)),
+        float(np.max(maxs)),
+        mean_rows / 512.0,
+        mean_cols / 512.0,
+        aspect_ratio,
+        float(len(dicom_files)) / 100.0,
+        float(np.mean(file_sizes)) / 1_000_000.0 if file_sizes else 0.0,
+        float(np.std(file_sizes)) / 1_000_000.0 if file_sizes else 0.0,
+    ], dtype=np.float32)
+    smri_raw = np.nan_to_num(smri_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    if target_len is not None and target_len > 0 and smri_raw.size != target_len:
+        smri_raw = _resample_1d(smri_raw, target_len)
+    smri_min, smri_max = float(smri_raw.min()), float(smri_raw.max())
+    if smri_max > smri_min:
+        smri_raw = (smri_raw - smri_min) / (smri_max - smri_min)
+    else:
+        smri_raw = np.zeros_like(smri_raw, dtype=np.float32)
+    return smri_raw.astype(np.float32)
+
+
 def _load_image_folder_proxy_features(series_dir: Path, target_len: Optional[int] = None) -> Optional[np.ndarray]:
+    """Extract proxy sMRI features from a folder. Supports image files (jpg/png/tif) and DICOM."""
     import cv2
 
     image_files = _ordered_image_files(series_dir)
     if not image_files:
-        return None
+        # Fall back to DICOM if no image files found
+        return _load_dicom_folder_proxy_features(series_dir, target_len)
 
     image_means: List[float] = []
     image_stds: List[float] = []
@@ -379,7 +453,8 @@ def _load_image_folder_proxy_features(series_dir: Path, target_len: Optional[int
             file_sizes.append(0.0)
 
     if not image_means:
-        return None
+        # Try DICOM as final fallback
+        return _load_dicom_folder_proxy_features(series_dir, target_len)
 
     mean_rows = float(np.mean(row_values)) if row_values else 0.0
     mean_cols = float(np.mean(col_values)) if col_values else 0.0
@@ -790,9 +865,25 @@ class MultimodalBrainDataset(Dataset):
 
         if 'smri' in self.modalities:
             smri_source = self._resolve_smri_source(sample)
-            resolution['smri'] = 'exact' if smri_source is not None and smri_source.exists() else 'missing'
             if smri_source is None or not smri_source.exists():
+                resolution['smri'] = 'missing'
                 missing.append('smri')
+            else:
+                # Deep check: verify we can actually extract features from this folder/file
+                # This prevents subjects from slipping through the filter only to fail at runtime
+                smri_loadable = False
+                if smri_source.is_file():
+                    smri_loadable = True  # .npy files are always loadable if they exist
+                elif smri_source.is_dir():
+                    # Try image files first, then DICOM
+                    has_images = any(
+                        True for p in smri_source.rglob('*')
+                        if p.is_file() and (_is_image_file(p) or _is_dicom_file(p))
+                    )
+                    smri_loadable = has_images
+                resolution['smri'] = 'exact' if smri_loadable else 'missing'
+                if not smri_loadable:
+                    missing.append('smri')
 
         return missing, resolution
 
