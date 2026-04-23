@@ -74,17 +74,10 @@ def extract_zip(zip_path: Path, target_dir: Path):
         logger.error(f"Failed to extract {zip_path.name}: {e}")
 
 def get_subject_id(path: Path) -> str:
-    """Extract subject ID from path using patterns from dataset.py."""
-    # Pattern for ADNI (e.g. 002_S_0295)
+    """Extract ADNI subject ID (NNN_S_NNNN) from a path."""
     adni_match = re.search(r"(\d{3}_S_\d{4})", str(path))
     if adni_match:
         return adni_match.group(1)
-    
-    # Pattern for OASIS (e.g. OAS30001)
-    oasis_match = re.search(r"(OAS\d+)", str(path))
-    if oasis_match:
-        return oasis_match.group(1)
-    
     return ""
 
 def is_fmri(path: Path) -> bool:

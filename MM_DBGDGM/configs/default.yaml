@@ -24,7 +24,7 @@ model:
   seq_len: 50  # Temporal window size
   
   # sMRI features
-  n_smri_features: 5  # ADNI: 5 features, OASIS: 6 features
+  n_smri_features: 5  # ADNI: 5 structural MRI features
   
   # VAE/Latent dimensions
   latent_dim: 256

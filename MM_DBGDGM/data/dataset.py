@@ -1,6 +1,6 @@
 """
 Dataset loaders for preprocessed fMRI and sMRI data.
-Handles both OASIS and ADNI datasets in DBGDGM format.
+Dataset loaders for preprocessed ADNI fMRI and sMRI data in DBGDGM format.
 
 The loader also supports local prepared sMRI JPG folders through metadata
 columns such as `smri_path` or `prepared_folder`, which makes it usable on a
@@ -103,46 +103,20 @@ def _series_has_fmri_clue(series_dir: Path) -> bool:
 
 
 def _extract_subject_id_from_series(series_dir: Path) -> str:
+    """Extract ADNI subject ID (NNN_S_NNNN) from a path."""
     parts = list(series_dir.parts)
 
-    # Prefer explicit ADNI subject ids wherever they appear in the path.
+    # Prefer explicit ADNI subject IDs (e.g. 002_S_0295) wherever they appear in the path.
     for part in parts:
         if re.search(r"(?i)^\d{3}_S_\d{4}$", part):
             return part
 
+    # Also handle the ADNI folder structure: .../ADNI/<subject_id>/...
     adni_index = next((idx for idx, part in enumerate(parts) if part.casefold() == "adni"), None)
     if adni_index is not None and adni_index + 1 < len(parts):
         return parts[adni_index + 1]
 
-    folder_name = series_dir.name.strip()
-    if folder_name:
-        if re.search(r"(?i)^OAS\d+_\d+_MR\d+$", folder_name):
-            return folder_name
-        if re.search(r"\d", folder_name) and folder_name.lower() not in {
-            "non demented",
-            "very mild dementia",
-            "mild dementia",
-            "moderate dementia",
-        }:
-            return folder_name
-
-    image_like_files = [
-        file_path for file_path in series_dir.iterdir()
-        if file_path.is_file() and (_is_image_file(file_path) or _is_dicom_file(file_path))
-    ]
-    if image_like_files:
-        first_name = image_like_files[0].stem
-        subject_match = re.match(r"^(.*?)(?:_mpr-\d+)?_\d+$", first_name, flags=re.IGNORECASE)
-        if subject_match:
-            return subject_match.group(1)
-        subject_match = re.match(r"^(.*?)(?:_\d+)$", first_name)
-        if subject_match:
-            return subject_match.group(1)
-        if "_mpr-" in first_name:
-            return first_name.split("_mpr-")[0]
-        return first_name
-
-    return folder_name or series_dir.parent.name
+    return ""
 
 
 def _extract_numeric_hint_from_path(name: str) -> Optional[int]:
