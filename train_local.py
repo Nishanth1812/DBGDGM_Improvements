@@ -42,7 +42,13 @@ from MM_DBGDGM.data.dataset import create_dataloaders
 from MM_DBGDGM.models.mm_dbgdgm import MM_DBGDGM
 from MM_DBGDGM.training.losses import MM_DBGDGM_Loss
 from MM_DBGDGM.training.trainer import Trainer
-from prepare_smri_jpg_dataset import DEFAULT_CLASS_LABELS, build_dataset as build_smri_dataset
+
+DEFAULT_CLASS_LABELS = [
+    ('CN', 0),
+    ('eMCI', 1),
+    ('lMCI', 2),
+    ('AD', 3),
+]
 
 
 def _coalesce(*values: Any, default: Any = None) -> Any:
@@ -515,13 +521,9 @@ def _prepare_raw_zip_inputs(
             logger.info(f"Reusing prepared SMRI dataset at {prepared_smri_root}")
         else:
             logger.info(f"Rebuilding prepared SMRI dataset from raw folders: {raw_smri_root}")
-            build_smri_dataset(
-                input_root=raw_smri_root,
-                output_root=prepared_smri_root,
-                transfer_mode="hardlink",
-                overwrite=True,
-                labels_csv=labels_csv,
-                logger=logger,
+            # Legacy raw zip path disabled since pipeline.py handles preprocessing
+            raise NotImplementedError(
+                "Direct raw SMRI preparation is disabled. Please use pipeline.py for end-to-end data preparation."
             )
 
     labels_csv = prepared_smri_root / "labels.csv"
