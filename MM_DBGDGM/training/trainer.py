@@ -126,6 +126,22 @@ class Trainer:
                 result[key] = float(value)
         return result
 
+
+    def _compute_metrics(self, all_targets: List[int], all_preds: List[int]) -> Dict[str, float]:
+        """Compute standard classification metrics."""
+        if not all_targets:
+            return {}
+        
+        acc = accuracy_score(all_targets, all_preds)
+        f1_macro = f1_score(all_targets, all_preds, average='macro', zero_division=0)
+        f1_weighted = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+        
+        return {
+            'accuracy': float(acc),
+            'f1_macro': float(f1_macro),
+            'f1_weighted': float(f1_weighted)
+        }
+
     def _compute_loss_dict(
         self,
         outputs,
@@ -252,6 +268,7 @@ class Trainer:
         self.model.train()
         self._enforce_frozen_modules()
         metrics = defaultdict(float)
+        all_targets, all_preds = [], []
         num_batches = 0
         epoch_number = epoch + 1
         total_batches = len(train_loader)
@@ -324,9 +341,13 @@ class Trainer:
                         metrics[f'train_{key}'] += loss_dict[key].detach()
                 
                 # Accuracy
-                preds = outputs['predictions']
-                acc = (preds == targets).float().mean()
+                preds_val = outputs['predictions']
+                acc = (preds_val == targets).float().mean()
                 metrics['train_accuracy'] += acc.detach()
+                
+                # Collect for final epoch metrics
+                all_targets.extend(targets.cpu().numpy().tolist())
+                all_preds.extend(preds_val.cpu().numpy().tolist())
             
             num_batches += 1
             
@@ -355,7 +376,18 @@ class Trainer:
         for key in metrics:
             metrics[key] /= num_batches
 
-        logger.info(f"Epoch {epoch_number}: training finished")
+        # Compute classification metrics
+        clf_metrics = self._compute_metrics(all_targets, all_preds)
+        metrics.update(clf_metrics)
+
+        # Build detailed loss string
+        loss_parts = [f"{k.replace('train_', '')}: {v:.4f}" for k, v in metrics.items() if k.startswith('train_') and k != 'train_total']
+        loss_summary = " | ".join(loss_parts[:4]) # Show first 4 components to keep it readable
+        
+        logger.info(
+            f"Epoch {epoch_number} [Train] | Loss: {metrics.get('train_total', 0):.4f} | "
+            f"Acc: {metrics.get('accuracy', 0):.4f} | F1: {metrics.get('f1_macro', 0):.4f} | {loss_summary}"
+        )
         
         return self._metrics_to_float_dict(dict(metrics))
     
@@ -472,7 +504,17 @@ class Trainer:
         for key in metrics:
             metrics[key] /= num_batches
 
-        logger.info(f"Epoch {epoch_number}: validation finished")
+        # Compute classification metrics
+        clf_metrics = self._compute_metrics(all_targets, all_preds)
+        metrics.update(clf_metrics)
+
+        loss_parts = [f"{k.replace('val_', '')}: {v:.4f}" for k, v in metrics.items() if k.startswith('val_') and k != 'val_total']
+        loss_summary = " | ".join(loss_parts[:4])
+
+        logger.info(
+            f"Epoch {epoch_number} [Val]   | Loss: {metrics.get('val_total', 0):.4f} | "
+            f"Acc: {metrics.get('accuracy', 0):.4f} | F1: {metrics.get('f1_macro', 0):.4f} | {loss_summary}"
+        )
         
         return self._metrics_to_float_dict(dict(metrics))
 
@@ -793,14 +835,16 @@ class Trainer:
 
                 current_lr = scheduler.get_last_lr()[0] if scheduler.get_last_lr() else learning_rate
 
-                # Log epoch results
+                # Log epoch results: detailed breakdown for user
+                train_recon = train_metrics.get('train_fmri_recon', 0) + train_metrics.get('train_smri_recon', 0)
+                val_recon = val_metrics.get('val_fmri_recon', 0) + val_metrics.get('val_smri_recon', 0)
+                
                 logger.info(
                     f"Epoch {epoch + 1}/{num_epochs} | "
-                    f"Train Loss: {train_metrics['train_total']:.4f}, "
-                    f"Train Acc: {train_metrics['train_accuracy']:.4f} | "
-                    f"Val Loss: {val_metrics['val_total']:.4f}, "
-                    f"Val Acc: {val_metrics['val_accuracy']:.4f} | "
-                    f"beta: {beta:.4f} | lr: {current_lr:.6g} | "
+                    f"T-Loss: {train_metrics['train_total']:.4f} (Rec:{train_recon:.4f}, KL:{train_metrics.get('train_kl',0):.4f}) | "
+                    f"T-Acc: {train_metrics['train_accuracy']:.4f} | "
+                    f"V-Acc: {val_metrics['val_accuracy']:.4f} | "
+                    f"lr: {current_lr:.6g} | "
                     f"Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
                 )
 

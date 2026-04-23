@@ -208,20 +208,49 @@ def preprocess_and_match():
     # Generate labels.csv with EXPLICIT absolute paths
     labels_csv = PROCESSED_DIR / "labels.csv"
     logger.info("Creating labels.csv with explicit modality paths...")
+    
+    # We'll import the loader here to use its feature extraction logic
+    from MM_DBGDGM.data.dataset import _load_image_folder_proxy_features
+    import numpy as np
     import pandas as pd
+    
     data = []
-    for subj_id in common_subjects:
-        # Use absolute paths to be 100% sure the loader finds them
+    print("Precomputing sMRI features for faster training...")
+    for i, subj_id in enumerate(common_subjects):
         fmri_path = (PROCESSED_DIR / "fmri" / subj_id).resolve()
         smri_path = (PROCESSED_DIR / "smri" / subj_id).resolve()
         
         if fmri_path.exists() and smri_path.exists():
+            # PRECOMPUTE sMRI features
+            features_file = smri_path / "features.npy"
+            if not features_file.exists():
+                print(f"  [{i+1}/{len(common_subjects)}] Extracting sMRI features for {subj_id}...")
+                features = _load_image_folder_proxy_features(smri_path)
+                if features is not None:
+                    np.save(str(features_file), features)
+                else:
+                    print(f"  [WARNING] Could not extract sMRI features for {subj_id}, skipping.")
+                    continue
+            
+            # PRECOMPUTE fMRI sequence
+            fmri_file = fmri_path / "fmri.npy"
+            if not fmri_file.exists():
+                print(f"  [{i+1}/{len(common_subjects)}] Pre-stacking fMRI sequence for {subj_id}...")
+                from MM_DBGDGM.data.dataset import _load_dicom_series_as_array
+                # Load the full 4D sequence (or 3D if single timepoint)
+                fmri_data = _load_dicom_series_as_array(fmri_path)
+                if fmri_data is not None:
+                    np.save(str(fmri_file), fmri_data.astype(np.float16)) # Use float16 to save space
+                else:
+                    print(f"  [WARNING] Could not stack fMRI for {subj_id}, skipping.")
+                    continue
+            
             data.append({
                 "subject_id": subj_id,
                 "timepoint": "T0",
                 "label": 0,
-                "fmri_path": str(fmri_path),
-                "smri_path": str(smri_path),
+                "fmri_path": str(fmri_file), # Point directly to the fast-loading file
+                "smri_path": str(features_file),
             })
     
     if not data:

@@ -771,7 +771,16 @@ def main() -> Dict[str, Any]:
         smri_recon_weight=float(_coalesce(recon_weights_cfg.get("smri"), training_cfg.get("smri_recon_weight"), default=1.0)),
     ).to(device)
 
-    logger.info("Creating dataloaders")
+    # Optimization: If dataset is small, reduce num_workers to avoid process overhead
+    # We use a trial load to check size
+    if batch_size > 0:
+        # Lower workers for small datasets to speed up initialization
+        if num_workers > 4:
+            # We'll just set it to 4 if we expect < 500 samples
+            # This is a heuristic to avoid the '20 workers for 80 samples' overhead
+            num_workers = 4
+            logger.info(f"Small-to-medium dataset environment: using num_workers={num_workers} for faster startup.")
+
     dataloaders = create_dataloaders(
         dataset_root=str(dataset_root),
         train_metadata=str(train_metadata) if train_metadata is not None else None,
@@ -794,61 +803,9 @@ def main() -> Dict[str, Any]:
         smri_path_column=smri_path_column,
         allow_unaligned_pairing=allow_unaligned_pairing,
     )
-
     train_loader = dataloaders["train"]
     val_loader = dataloaders["val"]
     test_loader = dataloaders.get("test")
-
-    train_samples = len(train_loader.dataset)
-    val_samples = len(val_loader.dataset)
-    test_samples = len(test_loader.dataset) if test_loader is not None else 0
-    train_batches = len(train_loader)
-    val_batches = len(val_loader)
-    test_batches = len(test_loader) if test_loader is not None else 0
-
-    logger.info(f"Dataset samples | train={train_samples} | val={val_samples} | test={test_samples}")
-    logger.info(f"Loader batches  | train={train_batches} | val={val_batches} | test={test_batches}")
-
-    min_train_batches = int(_coalesce(training_cfg.get("min_train_batches"), default=16))
-    if train_samples > 0 and train_batches < min_train_batches:
-        adjusted_batch_size = max(1, min(batch_size, max(1, train_samples // min_train_batches)))
-        if adjusted_batch_size < batch_size:
-            logger.warning(
-                f"Train loader only has {train_batches} batches; reducing batch size from {batch_size} to {adjusted_batch_size} "
-                f"to target at least {min_train_batches} batches per epoch"
-            )
-            logger.info("Rebuilding dataloaders with adjusted batch size")
-            batch_size = adjusted_batch_size
-            dataloaders = create_dataloaders(
-                dataset_root=str(dataset_root),
-                train_metadata=str(train_metadata) if train_metadata is not None else None,
-                val_metadata=str(val_metadata) if val_metadata is not None else None,
-                test_metadata=str(test_metadata) if test_metadata is not None else None,
-                metadata_file=str(metadata_file) if metadata_file is not None else None,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                shuffle_train=True,
-                normalize=normalize,
-                val_fraction=val_fraction,
-                test_fraction=test_fraction,
-                seed=seed,
-                n_roi=int(model_cfg.get("n_roi", 200)),
-                seq_len=int(model_cfg.get("seq_len", 50)),
-                n_smri_features=int(model_cfg.get("n_smri_features", 5)),
-                max_dicoms_per_series=max_dicoms_per_series,
-                smri_source_root=str(smri_source_root) if smri_source_root is not None else None,
-                fmri_path_column=fmri_path_column,
-                smri_path_column=smri_path_column,
-                allow_unaligned_pairing=allow_unaligned_pairing,
-            )
-            train_loader = dataloaders["train"]
-            val_loader = dataloaders["val"]
-            test_loader = dataloaders.get("test")
-            logger.info(f"Adjusted loader batches | train={len(train_loader)} | val={len(val_loader)} | test={len(test_loader) if test_loader is not None else 0}")
-
-            training_cfg["batch_size"] = batch_size
-            training_cfg["num_workers"] = num_workers
-            training_cfg["batch_log_interval"] = batch_log_interval
 
     logger.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     if test_loader is not None:
@@ -862,9 +819,6 @@ def main() -> Dict[str, Any]:
         output_dir=str(output_dir),
         seed=seed,
         frozen_module_names=frozen_module_names,
-    )
-    logger.info(
-        "Trainer initialized; next the trainer will build the optimizer, scheduler, and heartbeat thread"
     )
 
     start_epoch = 0

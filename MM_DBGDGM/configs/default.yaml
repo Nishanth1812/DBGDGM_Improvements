@@ -51,10 +51,10 @@ training:
   learning_rate: 0.001
   weight_decay: 1e-5  # L2 regularization
   
-  # Loss weights
-  lambda_kl: 0.1  # KL divergence weight
-  lambda_align: 0.1  # Cross-modal alignment weight
-  lambda_recon: 0.1  # Reconstruction weight
+  # Loss weights: adjusted for ADNI stability
+  lambda_kl: 0.01
+  lambda_align: 0.05
+  lambda_recon: 0.05
   
   # Early stopping
   patience: 10  # Stop if no improvement for N epochs

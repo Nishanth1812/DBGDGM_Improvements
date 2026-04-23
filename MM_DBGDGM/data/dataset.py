@@ -361,7 +361,10 @@ def _load_dicom_folder_proxy_features(series_dir: Path, target_len: Optional[int
             row_values.append(float(pixels.shape[0]))
             col_values.append(float(pixels.shape[-1] if pixels.ndim > 1 else pixels.shape[0]))
             file_sizes.append(float(dcm_path.stat().st_size))
-        except Exception:
+        except Exception as e:
+            # Only log first few errors to avoid spam
+            if len(image_means) < 1:
+                logger.debug(f"Failed to read DICOM pixels from {dcm_path.name}: {e}")
             continue
 
     if not image_means:
@@ -860,11 +863,12 @@ class MultimodalBrainDataset(Dataset):
                 if smri_source.is_file():
                     smri_loadable = True
                 elif smri_source.is_dir():
-                    # Relaxed check: just verify the folder actually has files
-                    has_any_files = any(True for p in smri_source.iterdir() if p.is_file())
-                    smri_loadable = has_any_files
+                    # Strict quality check: try a trial load of proxy features
+                    # This ensures we only keep subjects with readable DICOMs/Images
+                    features = _load_image_folder_proxy_features(smri_source)
+                    smri_loadable = features is not None
                     if not smri_loadable:
-                        logger.warning(f"sMRI folder is empty or has no files: {smri_source}")
+                        logger.warning(f"sMRI data unreadable or invalid format (dropping subject): {smri_source}")
                 resolution['smri'] = 'exact' if smri_loadable else 'missing'
                 if not smri_loadable:
                     missing.append('smri')
