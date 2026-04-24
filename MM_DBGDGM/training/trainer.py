@@ -88,9 +88,9 @@ class Trainer:
             logger.info(f"Frozen modules (eval mode during train): {sorted(self.frozen_module_names)}")
 
     def _gpu_memory_summary(self) -> str:
-        if self.device.type != 'cuda' or not torch.cuda.is_available():
+        """Return GPU memory stats for CUDA and ROCm (hip) devices."""
+        if not torch.cuda.is_available():
             return ''
-
         try:
             allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
             reserved = torch.cuda.memory_reserved(self.device) / (1024 ** 3)
@@ -477,16 +477,11 @@ class Trainer:
             acc = (preds == targets).float().mean()
             metrics['val_accuracy'] += acc.detach()
 
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{loss_dict['total'].item():.4f}",
-                'acc': f"{acc.item():.4f}"
-            })
-
+            # Log per-batch progress
             if batch_number == 1 or batch_number == total_batches or batch_number % max(1, log_every_n_batches) == 0:
                 logger.info(
                     f"Epoch {epoch_number}: validation batch {batch_number}/{total_batches} | "
-                    f"Loss: {loss_dict['total'].item():.4f} | Acc: {acc.item():.4f}" \
+                    f"Loss: {loss_dict['total'].item():.4f} | Acc: {acc.item():.4f}"
                     f"{self._gpu_memory_summary()}"
                 )
             
@@ -837,13 +832,12 @@ class Trainer:
 
                 # Log epoch results: detailed breakdown for user
                 train_recon = train_metrics.get('train_fmri_recon', 0) + train_metrics.get('train_smri_recon', 0)
-                val_recon = val_metrics.get('val_fmri_recon', 0) + val_metrics.get('val_smri_recon', 0)
-                
+
                 logger.info(
                     f"Epoch {epoch + 1}/{num_epochs} | "
-                    f"T-Loss: {train_metrics['train_total']:.4f} (Rec:{train_recon:.4f}, KL:{train_metrics.get('train_kl',0):.4f}) | "
-                    f"T-Acc: {train_metrics['train_accuracy']:.4f} | "
-                    f"V-Acc: {val_metrics['val_accuracy']:.4f} | "
+                    f"T-Loss: {train_metrics.get('train_total', 0):.4f} (Rec:{train_recon:.4f}, KL:{train_metrics.get('train_kl', 0):.4f}) | "
+                    f"T-Acc: {train_metrics.get('accuracy', 0):.4f} | "
+                    f"V-Acc: {val_metrics.get('accuracy', 0):.4f} | "
                     f"lr: {current_lr:.6g} | "
                     f"Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
                 )
@@ -853,8 +847,8 @@ class Trainer:
                     self.history[key].append(val)
 
                 # Early stopping
-                val_loss = val_metrics['val_total']
-                val_acc = val_metrics['val_accuracy']
+                val_loss = val_metrics.get('val_total', float('inf'))
+                val_acc = val_metrics.get('accuracy', 0.0)
 
                 if val_loss < self.best_val_loss:
                     logger.info(f"Validation loss improved from {self.best_val_loss:.4f} to {val_loss:.4f}")

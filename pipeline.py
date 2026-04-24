@@ -209,63 +209,65 @@ def preprocess_and_match():
     labels_csv = PROCESSED_DIR / "labels.csv"
     logger.info("Creating labels.csv with explicit modality paths...")
     
-    # We'll import the loader here to use its feature extraction logic
-    from MM_DBGDGM.data.dataset import _load_image_folder_proxy_features
     import numpy as np
     import pandas as pd
-    
+    from MM_DBGDGM.data.dataset import _load_image_folder_proxy_features
+
+    def _infer_label(subj_id: str) -> int:
+        """Infer class label from subject ID string. CN=0, eMCI=1, lMCI=2, AD=3."""
+        s = subj_id.lower()
+        if 'ad' in s:
+            return 3
+        if 'lmci' in s:
+            return 2
+        if 'mci' in s or 'emci' in s:
+            return 1
+        return 0
+
     data = []
-    print("Precomputing sMRI features for faster training...")
+    print("Precomputing sMRI proxy features for faster training...")
     for i, subj_id in enumerate(common_subjects):
         fmri_path = (PROCESSED_DIR / "fmri" / subj_id).resolve()
         smri_path = (PROCESSED_DIR / "smri" / subj_id).resolve()
-        
-        if fmri_path.exists() and smri_path.exists():
-            # PRECOMPUTE sMRI features
-            features_file = smri_path / "features.npy"
-            if not features_file.exists():
-                print(f"  [{i+1}/{len(common_subjects)}] Extracting sMRI features for {subj_id}...")
-                features = _load_image_folder_proxy_features(smri_path)
-                if features is not None:
-                    np.save(str(features_file), features)
-                else:
-                    print(f"  [WARNING] Could not extract sMRI features for {subj_id}, skipping.")
-                    continue
-            
-            # PRECOMPUTE fMRI sequence
-            fmri_file = fmri_path / "fmri.npy"
-            if not fmri_file.exists():
-                print(f"  [{i+1}/{len(common_subjects)}] Pre-stacking fMRI sequence for {subj_id}...")
-                from MM_DBGDGM.data.dataset import _load_dicom_series_as_array
-                # Load the full 4D sequence (or 3D if single timepoint)
-                fmri_data = _load_dicom_series_as_array(fmri_path)
-                if fmri_data is not None:
-                    np.save(str(fmri_file), fmri_data.astype(np.float16)) # Use float16 to save space
-                else:
-                    print(f"  [WARNING] Could not stack fMRI for {subj_id}, skipping.")
-                    continue
-            
-            data.append({
-                "subject_id": subj_id,
-                "timepoint": "T0",
-                "label": 0,
-                "fmri_path": str(fmri_file), # Point directly to the fast-loading file
-                "smri_path": str(features_file),
-            })
-    
+
+        if not (fmri_path.exists() and smri_path.exists()):
+            continue
+
+        # Precompute sMRI proxy features
+        features_file = smri_path / "features.npy"
+        if not features_file.exists():
+            print(f"  [{i+1}/{len(common_subjects)}] Extracting sMRI features for {subj_id}...")
+            features = _load_image_folder_proxy_features(smri_path)
+            if features is not None:
+                np.save(str(features_file), features)
+            else:
+                print(f"  [WARNING] Could not extract sMRI features for {subj_id}, skipping.")
+                continue
+
+        # Point fMRI to precomputed .npy if it exists, otherwise point to the folder
+        # (the dataset loader handles raw DICOMs at runtime)
+        fmri_npy = fmri_path / "fmri.npy"
+        fmri_ref = str(fmri_npy) if fmri_npy.exists() else str(fmri_path)
+
+        data.append({
+            "subject_id": subj_id,
+            "timepoint": "T0",
+            "label": _infer_label(subj_id),
+            "fmri_path": fmri_ref,
+            "smri_path": str(features_file),
+        })
+
     if not data:
         logger.error("No valid subject folders found in data/processed! Matching might have failed.")
         return False
-        
-    pd.DataFrame(data).to_csv(labels_csv, index=False)
-    logger.info(f"Created {labels_csv} with {len(data)} entries (explicit absolute paths).")
 
+    pd.DataFrame(data).to_csv(labels_csv, index=False)
+    logger.info(f"Created {labels_csv} with {len(data)} entries.")
     return True
 
 def run_training():
     logger.info("Launching training...")
-    
-    # Results will go to a timestamped folder inside results/
+
     results_dir = ROOT_DIR / "results" / datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -274,9 +276,8 @@ def run_training():
         "--dataset-root", str(PROCESSED_DIR),
         "--metadata-file", str(PROCESSED_DIR / "labels.csv"),
         "--output-dir", str(results_dir),
-        "--num-workers", "20",
-        "--batch-size", "64",
-        "--device", "cuda"
+        "--num-workers", "4",
+        "--batch-size", "32",
     ]
     
     logger.info(f"Command: {' '.join(cmd)}")

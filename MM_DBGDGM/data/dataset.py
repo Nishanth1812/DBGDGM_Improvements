@@ -990,6 +990,19 @@ class MultimodalBrainDataset(Dataset):
 
         _MODALITY_SOURCE_CACHE[cache_key] = resolutions_to_cache
 
+        # Assign the filtered list — this was the critical missing line
+        self.samples = kept_samples
+
+        if dropped:
+            preview = "; ".join(
+                f"{sid}:{tpt} ({reason})" for sid, tpt, reason in dropped[:8]
+            )
+            if len(dropped) > 8:
+                preview += f"; ... (+{len(dropped) - 8} more)"
+            logger.warning(
+                f"Dropping {len(dropped)}/{len(kept_samples) + len(dropped)} samples with missing modalities: {preview}"
+            )
+
         logger.info(
             "Pairing summary | "
             f"kept={self._pairing_stats['kept_samples']} | "
