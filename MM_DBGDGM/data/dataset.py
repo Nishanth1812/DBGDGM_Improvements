@@ -835,6 +835,24 @@ class MultimodalBrainDataset(Dataset):
                 })
                 if dicom_dirs:
                     return dicom_dirs[0], 'exact'
+            
+            # Fuzzy match for fMRI
+            if root.exists():
+                search_matches = [
+                    path for path in sorted(root.rglob(f"*{subject_id}*"))
+                    if path.is_dir()
+                ]
+                for match in search_matches:
+                    nested = _first_existing_path([
+                        match / 'fmri_windows_dbgdgm.npy',
+                        match / 'fmri.npy',
+                        *sorted(match.rglob('fmri_windows_dbgdgm.npy')),
+                    ])
+                    if nested:
+                        return nested, 'exact'
+                    # If it contains DICOMs, it's also valid
+                    if any(_is_dicom_file(p) for p in match.rglob('*') if p.is_file()):
+                        return match, 'exact'
 
         raw_series_candidates = self._dicom_series_index.get(subject_id, [])
         if raw_series_candidates:
@@ -898,20 +916,54 @@ class MultimodalBrainDataset(Dataset):
         if not self.samples:
             return
 
-        # Use cache key based on dataset root to allow sharing across Train/Val/Test
+        # Use cache key based on dataset root to allow sharing resolutions across Train/Val/Test
+        # We cache the RESOLUTIONS, not the sample list itself, to allow splitting.
         cache_key = hashlib.md5(str(self.dataset_root).encode()).hexdigest()
         if cache_key in _MODALITY_SOURCE_CACHE:
-            cached_samples, cached_stats = _MODALITY_SOURCE_CACHE[cache_key]
-            self.samples = cached_samples
-            self._pairing_stats.update(cached_stats)
-            logger.info(f"Using cached pairing summary ({len(self.samples)} samples kept)")
-            return
+            resolutions_cache = _MODALITY_SOURCE_CACHE[cache_key]
+            kept_samples: List[Dict[str, Any]] = []
+            for sample in self.samples:
+                s_id = _string_or_empty(sample.get('subject_id'))
+                t_pt = _string_or_empty(sample.get('timepoint'))
+                s_key = f"{s_id}_{t_pt}"
+                
+                if s_key in resolutions_cache:
+                    res_data = resolutions_cache[s_key]
+                    if res_data['is_valid']:
+                        sample['_modality_resolution'] = res_data['resolution']
+                        kept_samples.append(sample)
+                        self._pairing_stats['kept_samples'] += 1
+                        # Update stats for log
+                        fmri_res = res_data['resolution'].get('fmri', 'missing')
+                        if fmri_res == 'exact': self._pairing_stats['fmri_exact'] += 1
+                        elif fmri_res == 'canonical': self._pairing_stats['fmri_canonical'] += 1
+                        elif fmri_res == 'fallback': self._pairing_stats['fmri_fallback'] += 1
+                        else: self._pairing_stats['fmri_missing'] += 1
+                        if res_data['resolution'].get('smri', 'missing') == 'missing':
+                            self._pairing_stats['smri_missing'] += 1
+                    else:
+                        self._pairing_stats['dropped_samples'] += 1
+                else:
+                    # Not in cache, will need to be processed (shouldn't happen with shared root)
+                    pass
+            
+            if kept_samples:
+                self.samples = kept_samples
+                logger.info(f"Using cached modality resolutions ({len(self.samples)} samples kept)")
+                return
 
         kept_samples: List[Dict[str, Any]] = []
         dropped: List[Tuple[str, str, str]] = []
+        resolutions_to_cache = {}
 
         for sample in self.samples:
             missing, resolution = self._sample_missing_modalities(sample)
+            s_id = _string_or_empty(sample.get('subject_id'))
+            t_pt = _string_or_empty(sample.get('timepoint'))
+            s_key = f"{s_id}_{t_pt}"
+
+            is_valid = not bool(missing)
+            resolutions_to_cache[s_key] = {'is_valid': is_valid, 'resolution': resolution}
 
             fmri_resolution = resolution.get('fmri', 'missing')
             if fmri_resolution == 'exact':
@@ -927,37 +979,16 @@ class MultimodalBrainDataset(Dataset):
             if smri_resolution == 'missing':
                 self._pairing_stats['smri_missing'] += 1
 
-            if missing:
-                reasons = []
-                if 'fmri' in missing:
-                    reasons.append(f"missing fMRI: {resolution.get('fmri', 'missing')}")
-                if 'smri' in missing:
-                    reasons.append(f"missing sMRI: {resolution.get('smri', 'missing')}")
-                
-                dropped.append((
-                    _string_or_empty(sample.get('subject_id')),
-                    _string_or_empty(sample.get('timepoint')),
-                    " & ".join(reasons),
-                ))
+            if not is_valid:
+                dropped.append((s_id, t_pt, "missing data"))
                 self._pairing_stats['dropped_samples'] += 1
                 continue
+            
+            sample['_modality_resolution'] = resolution
             kept_samples.append(sample)
             self._pairing_stats['kept_samples'] += 1
 
-        if dropped:
-            preview = "; ".join(
-                f"{subject_id or '<empty-subject>'}:{timepoint or '<empty-timepoint>'} ({reason})"
-                for subject_id, timepoint, reason in dropped[:8]
-            )
-            if len(dropped) > 8:
-                preview = f"{preview}; ... (+{len(dropped) - 8} more)"
-
-            logger.warning(
-                f"Dropping {len(dropped)}/{len(self.samples)} sample(s) with unresolved modalities before training: {preview}"
-            )
-
-        self.samples = kept_samples
-        _MODALITY_SOURCE_CACHE[cache_key] = (kept_samples, self._pairing_stats.copy())
+        _MODALITY_SOURCE_CACHE[cache_key] = resolutions_to_cache
 
         logger.info(
             "Pairing summary | "
@@ -1018,7 +1049,18 @@ class MultimodalBrainDataset(Dataset):
                 return existing
 
             if root.exists():
-                search_matches = [path for path in sorted(root.rglob(subject_id)) if path.is_dir()]
+                # Fuzzy matching: look for any folder containing the subject_id
+                search_matches = [
+                    path for path in sorted(root.rglob(f"*{subject_id}*"))
+                    if path.is_dir() and (path / 'features.npy').exists()
+                ]
+                # If no features.npy folders, try any folder matching subject_id
+                if not search_matches:
+                    search_matches = [
+                        path for path in sorted(root.rglob(f"*{subject_id}*"))
+                        if path.is_dir()
+                    ]
+                
                 if search_matches:
                     direct_features = search_matches[0] / 'features.npy'
                     if direct_features.exists():
@@ -1375,6 +1417,11 @@ def create_dataloaders(
             f"Tuning DataLoader workers from {num_workers} to {effective_num_workers} for dataset_root={dataset_root_path}"
         )
         num_workers = effective_num_workers
+
+    # Force 0 workers for small datasets to prevent hangs on high-vCPU VMs
+    if len(train_dataset) < 200:
+        num_workers = 0
+        logger.info("Small dataset detected: forcing num_workers=0 for instant startup.")
     
     loader_kwargs = {
         'batch_size': batch_size,
