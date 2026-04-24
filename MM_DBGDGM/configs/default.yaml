@@ -42,8 +42,8 @@ model:
 # Training configuration
 training:
   # Data loading
-  batch_size: 32
-  num_workers: 20  # CPU workers for data loading on the 20-vCPU VM
+  batch_size: 16
+  num_workers: 4   # reduced — small dataset; avoids ROCm worker overhead
   batch_log_interval: 10  # Log training progress every N batches in the SSH terminal
   
   # Optimization

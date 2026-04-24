@@ -789,13 +789,13 @@ class Trainer:
                 else:
                     beta = min(1.0, epoch / annealing_epochs)
 
+                # ── Epoch header ─────────────────────────────────────────
                 logger.info(
-                    f"Epoch {epoch + 1}/{num_epochs} starting | beta={beta:.4f} | "
-                    f"best_val_loss={self.best_val_loss:.4f} | best_val_acc={self.best_val_acc:.4f}"
-                )
-                logger.info(
-                    f"Epoch {epoch + 1}: entering training phase | train_batches={len(train_loader)} | "
-                    f"val_batches={len(val_loader)}"
+                    f"\n{'─'*70}\n"
+                    f"  Epoch {epoch+1:>3}/{num_epochs}  "
+                    f"β={beta:.3f}  lr={learning_rate:.2e}  "
+                    f"best_val_acc={self.best_val_acc:.4f}\n"
+                    f"{'─'*70}"
                 )
 
                 self._set_progress(
@@ -830,16 +830,24 @@ class Trainer:
 
                 current_lr = scheduler.get_last_lr()[0] if scheduler.get_last_lr() else learning_rate
 
-                # Log epoch results: detailed breakdown for user
-                train_recon = train_metrics.get('train_fmri_recon', 0) + train_metrics.get('train_smri_recon', 0)
+                # ── Epoch summary (one clean line) ───────────────────────
+                train_recon = (train_metrics.get('train_fmri_recon', 0)
+                               + train_metrics.get('train_smri_recon', 0))
+                val_recon   = (val_metrics.get('val_fmri_recon', 0)
+                               + val_metrics.get('val_smri_recon', 0))
 
                 logger.info(
-                    f"Epoch {epoch + 1}/{num_epochs} | "
-                    f"T-Loss: {train_metrics.get('train_total', 0):.4f} (Rec:{train_recon:.4f}, KL:{train_metrics.get('train_kl', 0):.4f}) | "
-                    f"T-Acc: {train_metrics.get('accuracy', 0):.4f} | "
-                    f"V-Acc: {val_metrics.get('accuracy', 0):.4f} | "
-                    f"lr: {current_lr:.6g} | "
-                    f"Elapsed: {(time.perf_counter() - training_start) / 60:.1f} min"
+                    f"  TRAIN  loss={train_metrics.get('train_total',0):.4f}  "
+                    f"recon={train_recon:.4f}  kl={train_metrics.get('train_kl',0):.4f}  "
+                    f"acc={train_metrics.get('accuracy',0):.4f}  "
+                    f"f1={train_metrics.get('f1_macro',0):.4f}"
+                )
+                logger.info(
+                    f"  VAL    loss={val_metrics.get('val_total',0):.4f}  "
+                    f"recon={val_recon:.4f}  kl={val_metrics.get('val_kl',0):.4f}  "
+                    f"acc={val_metrics.get('accuracy',0):.4f}  "
+                    f"f1={val_metrics.get('f1_macro',0):.4f}  "
+                    f"lr={current_lr:.2e}"
                 )
 
                 # Store history

@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
 MM-DBGDGM End-to-End Pipeline
+─────────────────────────────
 Stages:
-  1. Download from Google Drive (optional)
-  2. Extract ZIP files into data/extracted/
-  3. Scan extracted data, pair fMRI <-> sMRI by subject ID
-  4. Infer diagnosis labels from folder path (CN/MCI/AD)
-  5. Precompute sMRI proxy features (features.npy per subject)
-  6. Write data/processed/labels.csv with explicit absolute paths
-  7. Launch train_local.py → evaluate → save best model
+  1. [Download]    Pull raw data from Google Drive
+  2. [Extract]     Unzip into data/extracted/
+  3. [Pair]        Match fMRI <-> sMRI by ADNI subject ID
+  4. [Label]       Infer CN/eMCI/lMCI/AD from folder path
+  5. [Features]    Precompute sMRI proxy features (features.npy)
+  6. [CSV]         Write data/processed/labels.csv
+  7. [Train]       Launch train_local.py
+  8. [Export]      Archive best model to best_model/
 
 Flags:
-  --skip-download    Skip GDrive download (use existing data/raw/)
-  --reprocess        Delete only data/processed/ and re-pair/re-label
-                     (keeps data/extracted/ intact — use this flag normally)
-  --force            Delete data/extracted/ AND data/processed/ — full reset
-  --skip-preprocess  Skip straight to training (labels.csv must exist)
+  --skip-download    Use existing data/raw/  (skip GDrive)
+  --skip-preprocess  Skip stages 2-6        (labels.csv must exist)
+  --reprocess        Re-run stages 2-6 only (keeps data/extracted/)
+  --force            Full reset: delete extracted + processed + model
 """
 
 import os
@@ -28,250 +29,298 @@ import subprocess
 import re
 from pathlib import Path
 from datetime import datetime
+from collections import Counter
 import concurrent.futures
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s - %(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("mm-dbgdgm-pipeline")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Logging — two handlers: coloured console + plain file
+# ═══════════════════════════════════════════════════════════════════════════════
+LOG_FILE = f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-ROOT_DIR   = Path(__file__).resolve().parent
-DATA_DIR   = ROOT_DIR / "data"
-RAW_DIR    = DATA_DIR / "raw"
-EXTRACT_DIR = DATA_DIR / "extracted"
+class _StageFormatter(logging.Formatter):
+    LEVEL_COLOURS = {
+        logging.DEBUG:    "\033[37m",   # grey
+        logging.INFO:     "\033[36m",   # cyan
+        logging.WARNING:  "\033[33m",   # yellow
+        logging.ERROR:    "\033[31m",   # red
+        logging.CRITICAL: "\033[1;31m", # bold red
+    }
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        colour = self.LEVEL_COLOURS.get(record.levelno, "")
+        ts = datetime.now().strftime("%H:%M:%S")
+        level = f"{colour}{record.levelname:<8}{self.RESET}"
+        return f"[{ts}] {level} {record.getMessage()}"
+
+
+class _PlainFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"[{ts}] [{record.levelname}] {record.getMessage()}"
+
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(_StageFormatter())
+
+_file_handler = logging.FileHandler(LOG_FILE)
+_file_handler.setFormatter(_PlainFormatter())
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+logger = logging.getLogger("pipeline")
+
+
+def _banner(title: str) -> None:
+    """Print a prominent stage banner."""
+    width = 60
+    line = "═" * width
+    logger.info(line)
+    logger.info(f"  {title}")
+    logger.info(line)
+
+
+def _section(title: str) -> None:
+    logger.info(f"── {title} {'─' * max(0, 55 - len(title))}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Paths
+# ═══════════════════════════════════════════════════════════════════════════════
+ROOT_DIR      = Path(__file__).resolve().parent
+DATA_DIR      = ROOT_DIR / "data"
+RAW_DIR       = DATA_DIR / "raw"
+EXTRACT_DIR   = DATA_DIR / "extracted"
 PROCESSED_DIR = DATA_DIR / "processed"
-MODEL_DIR  = ROOT_DIR / "best_model"
+MODEL_DIR     = ROOT_DIR / "best_model"
 
 GDRIVE_FOLDER_ID = "1Qx3jqL_eSxGfWvhxb20M6orxvKsQlQT9"
 
-# ── Modality classification tokens ──────────────────────────────────────────
+LABEL_NAMES = {0: "CN", 1: "eMCI", 2: "lMCI", 3: "AD"}
+BATCH_SIZE  = 16   # ← reduced for better gradient resolution on small dataset
+
+# ── Modality tokens ───────────────────────────────────────────────────────────
 FMRI_TOKENS = ("fmri", "bold", "rest", "rsfmri", "ep2d", "epi",
                 "functional", "asl", "pcasl", "resting")
 SMRI_TOKENS = ("mprage", "t1", "structural", "spgr", "t1w",
                 "bravo", "axial", "sagittal", "coronal")
 
-# ── Diagnosis label mapping from path keywords ───────────────────────────────
-# ADNI stores diagnosis in folder names like:
-#   extracted/Alzheimers_Disease/002_S_4213/...
-#   extracted/CN/002_S_4213/...
-#   extracted/MCI/002_S_4213/...
-LABEL_KEYWORDS = [
-    # (label_int, [path substrings to match, case-insensitive])
-    (3, ["alzheimer", "alzheimers", "_ad_", "/ad/", "\\ad\\"]),
-    (2, ["lmci", "late_mci", "late-mci"]),
-    (1, ["emci", "early_mci", "early-mci", "mci"]),
-    (0, ["cn", "cognitively_normal", "cogn_normal", "normal_control", "normal"]),
+# ── Diagnosis label inference (checked in priority order) ────────────────────
+# Matches any part of the FULL folder path (case-insensitive).
+# Add/extend keywords to match your exact ADNI folder naming.
+LABEL_RULES = [
+    (3, ["alzheimer", "alzheimers", "/ad/",  "_ad_",  "\\ad\\",  "dementia"]),
+    (2, ["lmci", "late_mci",  "late-mci",  "late mci"]),
+    (1, ["emci", "early_mci", "early-mci", "early mci", "/mci/", "_mci_", "\\mci\\"]),
+    (0, ["cognitively_normal", "cogn_normal", "normal_control", "/cn/", "_cn_", "\\cn\\"]),
 ]
 
 
-def ensure_dirs():
+def ensure_dirs() -> None:
     for d in [RAW_DIR, EXTRACT_DIR, PROCESSED_DIR, MODEL_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
-# ── Stage 1: Download ─────────────────────────────────────────────────────────
-def download_from_gdrive():
-    logger.info(f"Downloading data from Google Drive folder: {GDRIVE_FOLDER_ID}")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 1 — Download
+# ═══════════════════════════════════════════════════════════════════════════════
+def stage_download() -> None:
+    _banner("STAGE 1 / 7 — Download from Google Drive")
+    logger.info(f"GDrive folder ID : {GDRIVE_FOLDER_ID}")
+    logger.info(f"Destination      : {RAW_DIR}")
     try:
         import gdown
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
+        logger.info("gdown not found — installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown", "-q"])
         import gdown
     try:
         gdown.download_folder(id=GDRIVE_FOLDER_ID, output=str(RAW_DIR),
                               quiet=False, use_cookies=False)
-    except Exception as e:
-        logger.error(f"gdown failed: {e}")
-        logger.info("Download manually to data/raw/ and re-run with --skip-download")
+        logger.info("Download complete.")
+    except Exception as exc:
+        logger.error(f"Download failed: {exc}")
+        logger.warning("Place files manually in data/raw/ and re-run with --skip-download")
 
 
-# ── Stage 2: Extract ──────────────────────────────────────────────────────────
-def extract_zip(zip_path: Path, target_dir: Path):
-    logger.info(f"Extracting {zip_path.name}...")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 2 — Extract ZIPs
+# ═══════════════════════════════════════════════════════════════════════════════
+def _extract_one(zip_path: Path, target: Path) -> None:
+    logger.info(f"  Extracting {zip_path.name} ...")
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(target_dir)
-        logger.info(f"Done: {zip_path.name}")
-    except Exception as e:
-        logger.error(f"Failed to extract {zip_path.name}: {e}")
+            zf.extractall(target)
+        logger.info(f"  ✓ {zip_path.name}")
+    except Exception as exc:
+        logger.error(f"  ✗ {zip_path.name}: {exc}")
 
 
-def extract_all():
+def stage_extract() -> None:
+    _banner("STAGE 2 / 7 — Extract ZIP archives")
     zip_files = list(RAW_DIR.glob("*.zip"))
     if not zip_files:
-        logger.warning(f"No zip files in {RAW_DIR}.")
+        logger.warning(f"No .zip files found in {RAW_DIR} — skipping extraction.")
         return
     if EXTRACT_DIR.exists() and any(EXTRACT_DIR.iterdir()):
         logger.info("data/extracted/ is non-empty — skipping re-extraction.")
+        logger.info("  (run with --force to re-extract from scratch)")
         return
-    logger.info(f"Extracting {len(zip_files)} zip file(s)...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        ex.map(lambda z: extract_zip(z, EXTRACT_DIR), zip_files)
+    logger.info(f"Found {len(zip_files)} zip file(s) — extracting with 4 threads...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        pool.map(lambda z: _extract_one(z, EXTRACT_DIR), zip_files)
+    logger.info("Extraction complete.")
 
 
-# ── Stage 3: Subject ID extraction ────────────────────────────────────────────
-def get_subject_id(path: Path) -> str:
-    """Extract ADNI subject ID (NNN_S_NNNN) from a path."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 3 — Scan & Pair
+# ═══════════════════════════════════════════════════════════════════════════════
+def _get_subject_id(path: Path) -> str:
     match = re.search(r"(\d{3})[_.\-]S[_.\-](\d{4})", str(path))
-    if match:
-        return f"{match.group(1)}_S_{match.group(2)}"
-    return ""
+    return f"{match.group(1)}_S_{match.group(2)}" if match else ""
 
 
-# ── Stage 4: Label inference from full path ────────────────────────────────────
-def infer_label_from_path(path: Path) -> int:
-    """
-    Determine diagnosis label by scanning the full folder path.
-    Priority: AD (3) > lMCI (2) > eMCI/MCI (1) > CN (0).
-    Returns 0 (CN) if nothing matches — so it never crashes.
-    """
+def _infer_label(path: Path) -> int:
+    """Return diagnosis label from full folder path. Defaults to 0 (CN/unknown)."""
     p = str(path).lower().replace("\\", "/")
-    for label_int, keywords in LABEL_KEYWORDS:
+    for label_int, keywords in LABEL_RULES:
         if any(kw in p for kw in keywords):
             return label_int
-    return 0  # Default: CN / Unknown
+    return 0
 
 
-# ── Stage 5: Scan and pair ────────────────────────────────────────────────────
-def scan_and_pair():
+def stage_scan_and_pair() -> dict:
     """
     Walk EXTRACT_DIR, classify every leaf folder as fMRI or sMRI,
-    group by subject ID, and return only subjects that have both.
-    Returns: dict { subj_id: {'fmri': Path, 'smri': Path, 'label': int} }
+    group by subject ID, intersect, and return paired dict.
+    Returns: { subj_id: {'fmri': Path, 'smri': Path, 'label': int} }
     """
-    fmri_map: dict = {}  # subj_id -> [Path, ...]
+    _banner("STAGE 3 / 7 — Scan & pair fMRI ↔ sMRI subjects")
+    fmri_map: dict = {}
     smri_map: dict = {}
-    label_map: dict = {}  # subj_id -> int (from first encountered path)
+    label_map: dict = {}
+    folder_count = 0
 
-    found_folders = 0
-    logger.info(f"Scanning {EXTRACT_DIR} for ADNI subjects...")
-
-    for root, dirs, files in os.walk(EXTRACT_DIR):
+    logger.info(f"Walking {EXTRACT_DIR} ...")
+    for root, _dirs, files in os.walk(EXTRACT_DIR):
         if not files:
             continue
         root_path = Path(root)
-        subj_id = get_subject_id(root_path)
-        if not subj_id:
+        sid = _get_subject_id(root_path)
+        if not sid:
             continue
 
-        found_folders += 1
-        p_lower = str(root_path).lower()
+        folder_count += 1
+        p = str(root_path).lower()
+        is_f = any(t in p for t in FMRI_TOKENS)
+        is_s = any(t in p for t in SMRI_TOKENS)
 
-        is_f = any(t in p_lower for t in FMRI_TOKENS)
-        is_s = any(t in p_lower for t in SMRI_TOKENS)
+        if   is_f and not is_s:     fmri_map.setdefault(sid, []).append(root_path)
+        elif is_s and not is_f:     smri_map.setdefault(sid, []).append(root_path)
+        elif is_f and is_s:         fmri_map.setdefault(sid, []).append(root_path)
+        elif len(files) > 50:       fmri_map.setdefault(sid, []).append(root_path)
+        else:                       smri_map.setdefault(sid, []).append(root_path)
 
-        if is_f and not is_s:
-            fmri_map.setdefault(subj_id, []).append(root_path)
-        elif is_s and not is_f:
-            smri_map.setdefault(subj_id, []).append(root_path)
-        elif is_f and is_s:
-            # Both tokens present — BOLD wins
-            fmri_map.setdefault(subj_id, []).append(root_path)
-        else:
-            # Ambiguous: many files → fMRI (timeseries), few files → sMRI
-            if len(files) > 50:
-                fmri_map.setdefault(subj_id, []).append(root_path)
-            else:
-                smri_map.setdefault(subj_id, []).append(root_path)
+        if sid not in label_map:
+            label_map[sid] = _infer_label(root_path)
 
-        # Infer label from full path (done once per subject, from any folder)
-        if subj_id not in label_map:
-            label_map[subj_id] = infer_label_from_path(root_path)
+    paired_ids = sorted(set(fmri_map) & set(smri_map))
+    fmri_only  = set(fmri_map) - set(smri_map)
+    smri_only  = set(smri_map) - set(fmri_map)
 
-    paired = sorted(set(fmri_map) & set(smri_map))
+    _section("Scan results")
+    logger.info(f"  Leaf folders scanned      : {folder_count}")
+    logger.info(f"  Unique subjects (fMRI)    : {len(fmri_map)}")
+    logger.info(f"  Unique subjects (sMRI)    : {len(smri_map)}")
+    logger.info(f"  Paired (both modalities)  : {len(paired_ids)}")
+    if fmri_only:
+        logger.warning(f"  fMRI-only (no sMRI)       : {len(fmri_only)}  e.g. {list(fmri_only)[:3]}")
+    if smri_only:
+        logger.warning(f"  sMRI-only (no fMRI)       : {len(smri_only)}  e.g. {list(smri_only)[:3]}")
 
-    logger.info("─── Scan Summary ───────────────────────────────────────")
-    logger.info(f"  Leaf folders scanned : {found_folders}")
-    logger.info(f"  Subjects with fMRI   : {len(fmri_map)}")
-    logger.info(f"  Subjects with sMRI   : {len(smri_map)}")
-    logger.info(f"  Paired subjects      : {len(paired)}")
-    logger.info("────────────────────────────────────────────────────────")
-
-    if not paired:
-        logger.error("No paired subjects found. Check EXTRACT_DIR structure.")
-        if fmri_map:
-            logger.error(f"  Sample fMRI key: {list(fmri_map.keys())[0]}")
-        if smri_map:
-            logger.error(f"  Sample sMRI key: {list(smri_map.keys())[0]}")
+    if not paired_ids:
+        logger.error("No paired subjects found. Check your EXTRACT_DIR folder structure.")
         return {}
 
-    # Count label distribution
-    label_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-    result = {}
-    for sid in paired:
+    paired = {}
+    label_counts = Counter()
+    for sid in paired_ids:
         lbl = label_map.get(sid, 0)
         label_counts[lbl] += 1
-        result[sid] = {
-            'fmri': fmri_map[sid][0],
-            'smri': smri_map[sid][0],
-            'label': lbl,
-        }
+        paired[sid] = {'fmri': fmri_map[sid][0], 'smri': smri_map[sid][0], 'label': lbl}
 
-    logger.info(f"  Label distribution → CN:{label_counts[0]}  eMCI:{label_counts[1]}  lMCI:{label_counts[2]}  AD:{label_counts[3]}")
-    return result
+    _section("Label distribution (from folder paths)")
+    for lbl in sorted(LABEL_NAMES):
+        bar  = "█" * label_counts[lbl]
+        pct  = 100 * label_counts[lbl] / max(len(paired_ids), 1)
+        logger.info(f"  {LABEL_NAMES[lbl]:6s} [{lbl}]: {label_counts[lbl]:3d} ({pct:5.1f}%)  {bar}")
+
+    if label_counts[0] == len(paired_ids):
+        logger.warning(
+            "ALL subjects labelled CN (0). This usually means the diagnosis class "
+            "is not in the folder path. Check your EXTRACT_DIR structure and extend "
+            "LABEL_RULES in pipeline.py to match your folder names."
+        )
+
+    return paired
 
 
-# ── Stage 6: Preprocess and write labels.csv ──────────────────────────────────
-def preprocess_and_match() -> bool:
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 4-6 — Organise, compute features, write CSV
+# ═══════════════════════════════════════════════════════════════════════════════
+def stage_preprocess(paired: dict) -> bool:
+    _banner("STAGE 4-6 / 7 — Organise data + compute features + write CSV")
+
     import numpy as np
     import pandas as pd
     from MM_DBGDGM.data.dataset import _load_image_folder_proxy_features
 
-    if not EXTRACT_DIR.exists() or not any(EXTRACT_DIR.rglob('*')):
-        logger.error(f"EXTRACT_DIR is empty: {EXTRACT_DIR}")
-        return False
+    # ── 4: Copy matched folders into PROCESSED_DIR ───────────────────────────
+    _section("Organising subject folders")
+    copied = 0
+    for sid, info in paired.items():
+        for modality, src in [("fmri", info['fmri']), ("smri", info['smri'])]:
+            dst = PROCESSED_DIR / modality / sid
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                try:
+                    shutil.copytree(str(src), str(dst))
+                    copied += 1
+                except Exception as exc:
+                    logger.warning(f"  Could not copy {sid}/{modality}: {exc}")
+    logger.info(f"  Copied {copied} new folder(s) into {PROCESSED_DIR}")
 
-    paired = scan_and_pair()
-    if not paired:
-        return False
-
-    # Copy matched subjects into PROCESSED_DIR/fmri/ and PROCESSED_DIR/smri/
-    logger.info(f"Organising {len(paired)} subjects into {PROCESSED_DIR}...")
-    for subj_id, info in paired.items():
-        target_fmri = PROCESSED_DIR / "fmri" / subj_id
-        target_smri = PROCESSED_DIR / "smri" / subj_id
-        target_fmri.parent.mkdir(parents=True, exist_ok=True)
-        target_smri.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if not target_fmri.exists():
-                shutil.copytree(str(info['fmri']), str(target_fmri))
-            if not target_smri.exists():
-                shutil.copytree(str(info['smri']), str(target_smri))
-        except Exception as e:
-            logger.warning(f"Could not copy {subj_id}: {e}")
-
-    # Precompute sMRI features and build labels.csv
-    logger.info("Precomputing sMRI proxy features...")
+    # ── 5: Precompute sMRI features ──────────────────────────────────────────
+    _section("Precomputing sMRI proxy features")
     rows = []
-    for i, (subj_id, info) in enumerate(sorted(paired.items())):
-        fmri_path = (PROCESSED_DIR / "fmri" / subj_id).resolve()
-        smri_path = (PROCESSED_DIR / "smri" / subj_id).resolve()
+    skipped = 0
+    n = len(paired)
+
+    for i, (sid, info) in enumerate(sorted(paired.items()), 1):
+        fmri_path = (PROCESSED_DIR / "fmri" / sid).resolve()
+        smri_path = (PROCESSED_DIR / "smri" / sid).resolve()
 
         if not fmri_path.exists() or not smri_path.exists():
-            logger.warning(f"[{i+1}] Skipping {subj_id}: processed folder missing.")
+            logger.warning(f"  [{i:3d}/{n}] {sid} — processed folder missing, skipping.")
+            skipped += 1
             continue
 
-        # sMRI features
         features_file = smri_path / "features.npy"
         if not features_file.exists():
-            features = _load_image_folder_proxy_features(smri_path)
-            if features is None:
-                logger.warning(f"[{i+1}/{len(paired)}] Could not extract sMRI features for {subj_id}, skipping.")
+            feats = _load_image_folder_proxy_features(smri_path)
+            if feats is None:
+                logger.warning(f"  [{i:3d}/{n}] {sid} — sMRI feature extraction failed, skipping.")
+                skipped += 1
                 continue
-            np.save(str(features_file), features)
-            logger.info(f"[{i+1}/{len(paired)}] sMRI features saved → {features_file.name}")
+            np.save(str(features_file), feats)
+            logger.info(f"  [{i:3d}/{n}] {sid} — features.npy saved ({feats.shape})")
+        else:
+            logger.info(f"  [{i:3d}/{n}] {sid} — features.npy already exists, reusing.")
 
-        # fMRI reference: prefer precomputed .npy, otherwise point at folder
         fmri_npy = fmri_path / "fmri.npy"
         fmri_ref = str(fmri_npy) if fmri_npy.exists() else str(fmri_path)
 
         rows.append({
-            "subject_id": subj_id,
+            "subject_id": sid,
             "timepoint":  "T0",
             "label":      info['label'],
             "fmri_path":  fmri_ref,
@@ -279,111 +328,146 @@ def preprocess_and_match() -> bool:
         })
 
     if not rows:
-        logger.error("No valid subjects after feature extraction. Aborting.")
+        logger.error("No valid subjects after feature computation. Aborting.")
         return False
 
+    # ── 6: Write labels.csv ──────────────────────────────────────────────────
+    _section("Writing labels.csv")
     labels_csv = PROCESSED_DIR / "labels.csv"
-    pd.DataFrame(rows).to_csv(labels_csv, index=False)
-    logger.info(f"labels.csv written: {labels_csv}  ({len(rows)} subjects)")
+    df = pd.DataFrame(rows)
+    df.to_csv(labels_csv, index=False)
 
-    # Print label distribution in the final CSV
-    from collections import Counter
-    label_dist = Counter(r['label'] for r in rows)
-    logger.info(f"Final label distribution → CN:{label_dist[0]}  eMCI:{label_dist[1]}  lMCI:{label_dist[2]}  AD:{label_dist[3]}")
+    label_dist = Counter(df['label'])
+    logger.info(f"  Saved: {labels_csv}")
+    logger.info(f"  Total subjects : {len(df)}")
+    logger.info(f"  Skipped        : {skipped}")
+    for lbl in sorted(LABEL_NAMES):
+        logger.info(f"    {LABEL_NAMES[lbl]:6s} [{lbl}]: {label_dist[lbl]}")
+
     return True
 
 
-# ── Stage 7: Training ─────────────────────────────────────────────────────────
-def run_training() -> bool:
-    logger.info("Launching training...")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 7 — Training
+# ═══════════════════════════════════════════════════════════════════════════════
+def stage_train() -> bool:
+    _banner("STAGE 7 / 7 — Training")
+
+    labels_csv = PROCESSED_DIR / "labels.csv"
+    if not labels_csv.exists():
+        logger.error(f"labels.csv not found: {labels_csv}")
+        return False
+
     results_dir = ROOT_DIR / "results" / datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         sys.executable, "train_local.py",
         "--dataset-root",  str(PROCESSED_DIR),
-        "--metadata-file", str(PROCESSED_DIR / "labels.csv"),
+        "--metadata-file", str(labels_csv),
         "--output-dir",    str(results_dir),
         "--num-workers",   "4",
-        "--batch-size",    "32",
+        "--batch-size",    str(BATCH_SIZE),
     ]
     logger.info(f"Command: {' '.join(cmd)}")
+    logger.info(f"Results directory: {results_dir}")
+    logger.info(f"Batch size: {BATCH_SIZE}")
+
     process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
     process.wait()
 
     if process.returncode != 0:
-        logger.error("Training failed!")
+        logger.error(f"Training exited with code {process.returncode}.")
         return False
 
-    best_model_pt = results_dir / "best_model.pt"
-    if not best_model_pt.exists():
-        logger.error("best_model.pt not found in results directory.")
+    # ── Export artefacts ─────────────────────────────────────────────────────
+    best_pt = results_dir / "best_model.pt"
+    if not best_pt.exists():
+        logger.error("best_model.pt not produced. Training may have failed silently.")
         return False
 
-    logger.info("Training successful! Archiving artefacts...")
+    logger.info("Training successful — archiving artefacts...")
     if MODEL_DIR.exists():
         shutil.rmtree(MODEL_DIR)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copy(str(best_model_pt), str(MODEL_DIR / "best_model.pt"))
+    shutil.copy(str(best_pt), str(MODEL_DIR / "best_model.pt"))
 
-    for extra in ["inference_samples", "test_results.json", "run_summary.json"]:
-        src = results_dir / extra
+    for name in ("inference_samples", "test_results.json",
+                 "training_history.json", "run_summary.json"):
+        src = results_dir / name
         if src.exists():
-            dst = MODEL_DIR / extra
+            dst = MODEL_DIR / name
             shutil.copytree(str(src), str(dst)) if src.is_dir() else shutil.copy(str(src), str(dst))
 
-    logger.info(f"Artefacts stored in {MODEL_DIR}")
+    logger.info(f"  Best model   : {MODEL_DIR / 'best_model.pt'}")
+    logger.info(f"  Full results : {results_dir}")
     return True
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(description="MM-DBGDGM End-to-End Pipeline")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="MM-DBGDGM End-to-End Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--skip-download",   action="store_true",
-                        help="Skip GDrive download (use existing data/raw/)")
+                        help="Skip GDrive download; use existing data/raw/")
     parser.add_argument("--skip-preprocess", action="store_true",
-                        help="Skip preprocessing — labels.csv must already exist")
+                        help="Skip all preprocessing stages; labels.csv must exist")
     parser.add_argument("--reprocess",       action="store_true",
-                        help="Delete data/processed/ and redo pairing/labelling "
-                             "(keeps data/extracted/ intact)")
+                        help="Re-run preprocessing only (delete data/processed/, keep data/extracted/)")
     parser.add_argument("--force",           action="store_true",
-                        help="Full reset: delete data/extracted/ AND data/processed/")
+                        help="Full reset: delete data/extracted/, data/processed/, best_model/")
     args = parser.parse_args()
+
+    start_time = datetime.now()
+    _banner(f"MM-DBGDGM Pipeline  —  started {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Log file: {LOG_FILE}")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     if args.force:
-        logger.info("--force: clearing data/extracted/ and data/processed/")
-        shutil.rmtree(EXTRACT_DIR, ignore_errors=True)
-        shutil.rmtree(PROCESSED_DIR, ignore_errors=True)
-        shutil.rmtree(MODEL_DIR, ignore_errors=True)
+        logger.info("--force: removing data/extracted/, data/processed/, best_model/")
+        for d in [EXTRACT_DIR, PROCESSED_DIR, MODEL_DIR]:
+            shutil.rmtree(d, ignore_errors=True)
+            logger.info(f"  Removed {d}")
     elif args.reprocess:
-        logger.info("--reprocess: clearing data/processed/ only (keeping data/extracted/)")
+        logger.info("--reprocess: removing data/processed/ only")
         shutil.rmtree(PROCESSED_DIR, ignore_errors=True)
+        logger.info(f"  Removed {PROCESSED_DIR}")
 
     ensure_dirs()
 
-    # ── Download ──────────────────────────────────────────────────────────────
+    # ── Run stages ────────────────────────────────────────────────────────────
     if not args.skip_download:
-        download_from_gdrive()
+        stage_download()
 
-    # ── Extract ───────────────────────────────────────────────────────────────
-    if not args.skip_preprocess and not args.skip_download:
-        extract_all()
-    elif not args.skip_preprocess:
-        extract_all()   # still extract even with --skip-download if needed
-
-    # ── Preprocess & Match ────────────────────────────────────────────────────
     if not args.skip_preprocess:
-        if not preprocess_and_match():
-            logger.error("Preprocessing/matching failed. Aborting pipeline.")
+        stage_extract()
+
+        paired = stage_scan_and_pair()
+        if not paired:
+            logger.error("Pairing failed — aborting.")
             sys.exit(1)
 
-    # ── Train ─────────────────────────────────────────────────────────────────
-    if run_training():
-        logger.info("Pipeline completed successfully.")
-    else:
-        logger.error("Pipeline failed during training.")
-        sys.exit(1)
+        if not stage_preprocess(paired):
+            logger.error("Preprocessing failed — aborting.")
+            sys.exit(1)
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    success = stage_train()
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    elapsed = datetime.now() - start_time
+    _banner("PIPELINE COMPLETE" if success else "PIPELINE FAILED")
+    logger.info(f"  Status  : {'✓ SUCCESS' if success else '✗ FAILED'}")
+    logger.info(f"  Elapsed : {str(elapsed).split('.')[0]}")
+    logger.info(f"  Log     : {LOG_FILE}")
+    if success:
+        logger.info(f"  Model   : {MODEL_DIR / 'best_model.pt'}")
+
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
