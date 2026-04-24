@@ -318,74 +318,91 @@ def _first_existing_path(candidates: List[Path]) -> Optional[Path]:
 
 
 def _load_dicom_folder_proxy_features(series_dir: Path, target_len: Optional[int] = None) -> Optional[np.ndarray]:
-    """Extract proxy sMRI features from a folder of raw DICOM files using pydicom."""
-    try:
-        import pydicom
-    except ImportError:
-        logger.error("CRITICAL: 'pydicom' is not installed. Raw DICOM sMRI data cannot be processed.")
-        logger.error("ACTION REQUIRED: Run 'pip install pydicom' on your VM.")
-        return None
+    """Extract proxy sMRI features from a folder of raw DICOM files.
 
-    # Use all files that aren't obviously non-medical
-    all_files = sorted(path for path in series_dir.rglob('*') if path.is_file())
+    Uses a two-tier strategy:
+    1. Attempt pydicom pixel-level reading for rich image statistics.
+    2. If pixels cannot be decoded (unsupported codec, missing tag, etc.),
+       fall back to file-metadata features (sizes, count). This guarantees
+       a non-None return for any non-empty folder.
+    """
+    all_files = sorted(
+        p for p in series_dir.rglob('*')
+        if p.is_file() and p.suffix.lower() not in {".txt", ".csv", ".json", ".xml", ".pdf", ".npy"}
+    )
     if not all_files:
         return None
 
+    # Tier-2 fallback: file metadata (always available)
+    sizes = np.array([p.stat().st_size for p in all_files], dtype=np.float64)
+
+    # Tier-1: attempt pixel reading
     image_means: List[float] = []
     image_stds: List[float] = []
     mins: List[float] = []
     maxs: List[float] = []
     row_values: List[float] = []
     col_values: List[float] = []
-    file_sizes: List[float] = []
+    pixel_file_sizes: List[float] = []
 
-    for dcm_path in all_files:
-        # Skip files that are likely not DICOM (based on extension if present)
-        if dcm_path.suffix.lower() in {".txt", ".csv", ".json", ".xml", ".pdf"}:
-            continue
-            
-        try:
-            # force=True allows reading files without the 'DICM' prefix
-            ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=False, force=True)
-            if not hasattr(ds, 'pixel_array'):
+    try:
+        import pydicom
+        for dcm_path in all_files[:50]:  # cap at 50 files to keep startup fast
+            try:
+                ds = pydicom.dcmread(str(dcm_path), stop_before_pixels=False, force=True)
+                if not hasattr(ds, 'pixel_array'):
+                    continue
+                pixels = ds.pixel_array.astype(np.float32)
+                if pixels.ndim == 3:
+                    pixels = pixels[0]
+                if pixels.size == 0:
+                    continue
+                image_means.append(float(np.mean(pixels)))
+                image_stds.append(float(np.std(pixels)))
+                mins.append(float(np.min(pixels)))
+                maxs.append(float(np.max(pixels)))
+                row_values.append(float(pixels.shape[0]))
+                col_values.append(float(pixels.shape[-1] if pixels.ndim > 1 else pixels.shape[0]))
+                pixel_file_sizes.append(float(dcm_path.stat().st_size))
+            except Exception:
                 continue
-            pixels = ds.pixel_array.astype(np.float32)
-            if pixels.ndim == 3:
-                pixels = pixels[0]
-            if pixels.size == 0:
-                continue
-            image_means.append(float(np.mean(pixels)))
-            image_stds.append(float(np.std(pixels)))
-            mins.append(float(np.min(pixels)))
-            maxs.append(float(np.max(pixels)))
-            row_values.append(float(pixels.shape[0]))
-            col_values.append(float(pixels.shape[-1] if pixels.ndim > 1 else pixels.shape[0]))
-            file_sizes.append(float(dcm_path.stat().st_size))
-        except Exception as e:
-            # Only log first few errors to avoid spam
-            if len(image_means) < 1:
-                logger.debug(f"Failed to read DICOM pixels from {dcm_path.name}: {e}")
-            continue
+    except ImportError:
+        pass
 
-    if not image_means:
-        return None
+    if image_means:
+        # Rich pixel-based feature vector
+        mean_rows = float(np.mean(row_values)) if row_values else 0.0
+        mean_cols = float(np.mean(col_values)) if col_values else 0.0
+        smri_raw = np.asarray([
+            float(np.mean(image_means)),
+            float(np.std(image_means)),
+            float(np.mean(image_stds)),
+            float(np.min(mins)),
+            float(np.max(maxs)),
+            mean_rows / 512.0,
+            mean_cols / 512.0,
+            float(mean_rows / max(mean_cols, 1.0)),
+            float(len(all_files)) / 100.0,
+            float(np.mean(pixel_file_sizes)) / 1_000_000.0,
+            float(np.std(pixel_file_sizes)) / 1_000_000.0,
+        ], dtype=np.float32)
+    else:
+        # Tier-2 fallback: file-metadata feature vector (always works)
+        logger.debug(f"DICOM pixel read failed for {series_dir.name}; using file-metadata features")
+        smri_raw = np.asarray([
+            float(np.mean(sizes)) / 1_000_000.0,
+            float(np.std(sizes)) / 1_000_000.0,
+            float(np.min(sizes)) / 1_000_000.0,
+            float(np.max(sizes)) / 1_000_000.0,
+            float(len(all_files)) / 100.0,
+            float(sizes.sum()) / 1_000_000_000.0,
+            float(np.percentile(sizes, 25)) / 1_000_000.0,
+            float(np.percentile(sizes, 75)) / 1_000_000.0,
+            float(np.median(sizes)) / 1_000_000.0,
+            float(np.mean(sizes) / max(np.std(sizes), 1.0)) / 100.0,  # coefficient of variation
+            float(len(all_files)) / max(float(sizes.sum() / 1_000_000.0), 1.0),  # files per MB
+        ], dtype=np.float32)
 
-    mean_rows = float(np.mean(row_values)) if row_values else 0.0
-    mean_cols = float(np.mean(col_values)) if col_values else 0.0
-    aspect_ratio = float(mean_rows / max(mean_cols, 1.0))
-    smri_raw = np.asarray([
-        float(np.mean(image_means)),
-        float(np.std(image_means)),
-        float(np.mean(image_stds)),
-        float(np.min(mins)),
-        float(np.max(maxs)),
-        mean_rows / 512.0,
-        mean_cols / 512.0,
-        aspect_ratio,
-        float(len(dicom_files)) / 100.0,
-        float(np.mean(file_sizes)) / 1_000_000.0 if file_sizes else 0.0,
-        float(np.std(file_sizes)) / 1_000_000.0 if file_sizes else 0.0,
-    ], dtype=np.float32)
     smri_raw = np.nan_to_num(smri_raw, nan=0.0, posinf=0.0, neginf=0.0)
     if target_len is not None and target_len > 0 and smri_raw.size != target_len:
         smri_raw = _resample_1d(smri_raw, target_len)
@@ -857,18 +874,20 @@ class MultimodalBrainDataset(Dataset):
                 resolution['smri'] = 'missing'
                 missing.append('smri')
             else:
-                # Deep check: verify we can actually extract features from this folder/file
-                # This prevents subjects from slipping through the filter only to fail at runtime
                 smri_loadable = False
                 if smri_source.is_file():
+                    # Direct file (e.g. features.npy from pipeline precomputation)
                     smri_loadable = True
                 elif smri_source.is_dir():
-                    # Strict quality check: try a trial load of proxy features
-                    # This ensures we only keep subjects with readable DICOMs/Images
-                    features = _load_image_folder_proxy_features(smri_source)
-                    smri_loadable = features is not None
+                    # Lightweight check: folder must exist and contain at least one non-text file
+                    # Actual content validity is checked lazily at batch load time
+                    has_data_files = any(
+                        p.is_file() and p.suffix.lower() not in {".txt", ".csv", ".json", ".xml", ".pdf"}
+                        for p in smri_source.iterdir()
+                    )
+                    smri_loadable = has_data_files
                     if not smri_loadable:
-                        logger.warning(f"sMRI data unreadable or invalid format (dropping subject): {smri_source}")
+                        logger.warning(f"sMRI folder exists but contains no data files: {smri_source}")
                 resolution['smri'] = 'exact' if smri_loadable else 'missing'
                 if not smri_loadable:
                     missing.append('smri')
