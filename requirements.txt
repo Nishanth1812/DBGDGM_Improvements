@@ -14,3 +14,4 @@ tensorboard>=2.15
 tqdm>=4.66
 opencv-python-headless>=4.9
 gdown>=5.1
+torch_geometric>=2.5.0
