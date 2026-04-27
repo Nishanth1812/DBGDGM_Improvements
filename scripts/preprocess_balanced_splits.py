@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import re
 from collections import Counter, defaultdict
@@ -17,6 +18,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
+
+
+LOGGER = logging.getLogger("preprocess_balanced_splits")
 
 FMRI_TOKENS = (
     "fmri", "bold", "rest", "rsfmri", "ep2d", "epi", "functional", "asl", "pcasl", "resting",
@@ -42,7 +46,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inference-count", type=int, default=1)
+    parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
+
+
+def configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(level=level, format="[%(asctime)s] [%(levelname)s] %(message)s")
+
+
+def counter_to_dict(counter: Counter) -> Dict[str, int]:
+    return {str(key): int(value) for key, value in sorted(counter.items(), key=lambda kv: kv[0])}
 
 
 def get_subject_id(path: Path) -> str:
@@ -60,6 +74,14 @@ def infer_label(path: Path) -> int:
     return 0
 
 
+def infer_label_with_match(path: Path) -> Tuple[int, bool]:
+    normalized = str(path).lower().replace("\\", "/")
+    for label, keywords in LABEL_RULES:
+        if any(keyword in normalized for keyword in keywords):
+            return label, True
+    return 0, False
+
+
 def iter_leaf_dirs(root: Path) -> Iterable[Path]:
     for candidate in root.rglob("*"):
         if not candidate.is_dir():
@@ -72,14 +94,22 @@ def iter_leaf_dirs(root: Path) -> Iterable[Path]:
             yield candidate
 
 
-def pair_modalities(extracted_root: Path) -> List[Dict[str, object]]:
+def pair_modalities(extracted_root: Path) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     fmri_map: Dict[str, List[Path]] = defaultdict(list)
     smri_map: Dict[str, List[Path]] = defaultdict(list)
     label_map: Dict[str, int] = {}
+    label_default_subjects: set[str] = set()
+
+    scanned_leaf_dirs = 0
+    skipped_missing_subject_id = 0
+    heuristic_as_fmri = 0
+    heuristic_as_smri = 0
 
     for folder in iter_leaf_dirs(extracted_root):
+        scanned_leaf_dirs += 1
         sid = get_subject_id(folder)
         if not sid:
+            skipped_missing_subject_id += 1
             continue
 
         text = str(folder).lower()
@@ -96,13 +126,32 @@ def pair_modalities(extracted_root: Path) -> List[Dict[str, object]]:
             file_count = sum(1 for child in folder.iterdir() if child.is_file())
             if file_count > 50:
                 fmri_map[sid].append(folder)
+                heuristic_as_fmri += 1
             else:
                 smri_map[sid].append(folder)
+                heuristic_as_smri += 1
 
         if sid not in label_map:
-            label_map[sid] = infer_label(folder)
+            inferred_label, matched = infer_label_with_match(folder)
+            label_map[sid] = inferred_label
+            if not matched:
+                label_default_subjects.add(sid)
 
     paired_ids = sorted(set(fmri_map) & set(smri_map))
+    fmri_only_ids = sorted(set(fmri_map) - set(smri_map))
+    smri_only_ids = sorted(set(smri_map) - set(fmri_map))
+
+    LOGGER.info("Leaf folders scanned: %s", scanned_leaf_dirs)
+    LOGGER.info("Folders skipped (no subject id): %s", skipped_missing_subject_id)
+    LOGGER.info("Subjects with fMRI candidates: %s", len(fmri_map))
+    LOGGER.info("Subjects with sMRI candidates: %s", len(smri_map))
+    LOGGER.info("Paired subjects (both modalities): %s", len(paired_ids))
+    LOGGER.info("Heuristic-only modality assignment -> fMRI: %s | sMRI: %s", heuristic_as_fmri, heuristic_as_smri)
+    if fmri_only_ids:
+        LOGGER.warning("fMRI-only subjects: %s (examples: %s)", len(fmri_only_ids), fmri_only_ids[:5])
+    if smri_only_ids:
+        LOGGER.warning("sMRI-only subjects: %s (examples: %s)", len(smri_only_ids), smri_only_ids[:5])
+
     rows: List[Dict[str, object]] = []
     for sid in paired_ids:
         fmri_path = fmri_map[sid][0]
@@ -118,7 +167,30 @@ def pair_modalities(extracted_root: Path) -> List[Dict[str, object]]:
                 "smri_path": str(smri_path),
             }
         )
-    return rows
+
+    paired_label_counts = Counter(int(label_map.get(row["subject_id"], 0)) for row in rows)
+    LOGGER.info("Paired label distribution: %s", counter_to_dict(paired_label_counts))
+    if label_default_subjects:
+        LOGGER.warning(
+            "Subjects with default label=0 (no label keyword match): %s (examples: %s)",
+            len(label_default_subjects),
+            sorted(label_default_subjects)[:5],
+        )
+
+    diagnostics = {
+        "leaf_dirs_scanned": scanned_leaf_dirs,
+        "skipped_missing_subject_id": skipped_missing_subject_id,
+        "heuristic_as_fmri": heuristic_as_fmri,
+        "heuristic_as_smri": heuristic_as_smri,
+        "subjects_with_fmri": len(fmri_map),
+        "subjects_with_smri": len(smri_map),
+        "paired_subjects": len(paired_ids),
+        "fmri_only_subjects": len(fmri_only_ids),
+        "smri_only_subjects": len(smri_only_ids),
+        "label_default_subjects": len(label_default_subjects),
+        "paired_label_distribution": counter_to_dict(paired_label_counts),
+    }
+    return rows, diagnostics
 
 
 def per_class_split_count(class_size: int, train_ratio: float, val_ratio: float) -> Tuple[int, int, int]:
@@ -158,7 +230,7 @@ def build_balanced_splits(
     inference_count: int,
     train_ratio: float,
     val_ratio: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     rng = random.Random(seed)
     df = pd.DataFrame(rows)
     if df.empty:
@@ -173,16 +245,31 @@ def build_balanced_splits(
     inference_df = df.loc[inference_indices].reset_index(drop=True)
     remaining_df = df.drop(index=inference_indices).reset_index(drop=True)
 
+    before_holdout_counts = Counter(df["label"]) if "label" in df.columns else Counter()
+    after_holdout_counts = Counter(remaining_df["label"]) if "label" in remaining_df.columns else Counter()
+    inference_counts = Counter(inference_df["label"]) if "label" in inference_df.columns else Counter()
+
+    LOGGER.info("Label distribution before inference holdout: %s", counter_to_dict(before_holdout_counts))
+    LOGGER.info("Label distribution after inference holdout: %s", counter_to_dict(after_holdout_counts))
+    LOGGER.info("Inference holdout distribution: %s", counter_to_dict(inference_counts))
+
     class_groups = {
         int(label): group.sample(frac=1.0, random_state=seed).reset_index(drop=True)
         for label, group in remaining_df.groupby("label")
     }
     if len(class_groups) < 2:
-        raise ValueError("Need at least two classes for balanced splitting.")
+        raise ValueError(
+            "Need at least two classes for balanced splitting. "
+            f"Observed labels after inference holdout: {counter_to_dict(after_holdout_counts)}. "
+            "This usually means folder names do not encode diagnosis labels for LABEL_RULES."
+        )
 
     min_count = min(len(group) for group in class_groups.values())
     if min_count < 3:
-        raise ValueError("At least 3 samples per class are required after holding inference sample(s).")
+        raise ValueError(
+            "At least 3 samples per class are required after holding inference sample(s). "
+            f"Observed per-class counts: {counter_to_dict(Counter(remaining_df['label']))}"
+        )
 
     trimmed_groups = {label: group.iloc[:min_count].copy() for label, group in class_groups.items()}
     balanced_df = pd.concat(trimmed_groups.values(), ignore_index=True)
@@ -192,6 +279,12 @@ def build_balanced_splits(
     test_chunks: List[pd.DataFrame] = []
 
     train_count, val_count, test_count = per_class_split_count(min_count, train_ratio, val_ratio)
+    LOGGER.info(
+        "Balanced per-class split counts -> train: %s, val: %s, test: %s (per class)",
+        train_count,
+        val_count,
+        test_count,
+    )
 
     for _, group in sorted(trimmed_groups.items()):
         train_chunks.append(group.iloc[:train_count])
@@ -202,11 +295,22 @@ def build_balanced_splits(
     val_df = pd.concat(val_chunks, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
     test_df = pd.concat(test_chunks, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
-    return balanced_df, train_df, val_df, test_df, inference_df
+    diagnostics = {
+        "label_distribution_before_holdout": counter_to_dict(before_holdout_counts),
+        "label_distribution_after_holdout": counter_to_dict(after_holdout_counts),
+        "inference_distribution": counter_to_dict(inference_counts),
+        "balanced_distribution": counter_to_dict(Counter(balanced_df["label"])),
+        "train_distribution": counter_to_dict(Counter(train_df["label"])),
+        "val_distribution": counter_to_dict(Counter(val_df["label"])),
+        "test_distribution": counter_to_dict(Counter(test_df["label"])),
+    }
+
+    return balanced_df, train_df, val_df, test_df, inference_df, diagnostics
 
 
 def main() -> None:
     args = parse_args()
+    configure_logging(args.log_level)
 
     ratio_total = args.train_ratio + args.val_ratio + args.test_ratio
     if abs(ratio_total - 1.0) > 1e-6:
@@ -219,14 +323,30 @@ def main() -> None:
     if not extracted_root.exists():
         raise FileNotFoundError(f"Extracted root not found: {extracted_root}")
 
-    rows = pair_modalities(extracted_root)
-    balanced_df, train_df, val_df, test_df, inference_df = build_balanced_splits(
-        rows=rows,
-        seed=args.seed,
-        inference_count=args.inference_count,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-    )
+    LOGGER.info("Starting preprocessing")
+    LOGGER.info("Extracted root: %s", extracted_root)
+    LOGGER.info("Output root: %s", output_root)
+    rows, pairing_diagnostics = pair_modalities(extracted_root)
+
+    try:
+        balanced_df, train_df, val_df, test_df, inference_df, split_diagnostics = build_balanced_splits(
+            rows=rows,
+            seed=args.seed,
+            inference_count=args.inference_count,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+        )
+    except Exception:
+        failure_summary = {
+            "extracted_root": str(extracted_root),
+            "output_root": str(output_root),
+            "pairing_diagnostics": pairing_diagnostics,
+            "hint": "If all labels are 0, update LABEL_RULES or provide label-aware folder naming.",
+        }
+        failure_path = output_root / "split_failure_diagnostics.json"
+        failure_path.write_text(json.dumps(failure_summary, indent=2), encoding="utf-8")
+        LOGGER.error("Wrote failure diagnostics to %s", failure_path)
+        raise
 
     all_path = output_root / "all_balanced_metadata.csv"
     train_path = output_root / "train_metadata.csv"
@@ -255,6 +375,10 @@ def main() -> None:
             "val": {str(k): int(v) for k, v in Counter(val_df["label"]).items()},
             "test": {str(k): int(v) for k, v in Counter(test_df["label"]).items()},
             "inference": {str(k): int(v) for k, v in Counter(inference_df["label"]).items()},
+        },
+        "diagnostics": {
+            "pairing": pairing_diagnostics,
+            "splits": split_diagnostics,
         },
         "files": {
             "all_balanced_metadata": str(all_path),
