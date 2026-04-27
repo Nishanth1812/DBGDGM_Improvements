@@ -15,7 +15,7 @@ import random
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -36,6 +36,25 @@ LABEL_RULES: List[Tuple[int, List[str]]] = [
     (0, ["cognitively_normal", "cogn_normal", "normal_control", "/cn/", "_cn_", "\\cn\\"]),
 ]
 
+LABEL_NAME_TO_ID = {
+    "cn": 0,
+    "normal": 0,
+    "control": 0,
+    "emci": 1,
+    "early_mci": 1,
+    "early-mci": 1,
+    "lmci": 2,
+    "late_mci": 2,
+    "late-mci": 2,
+    "ad": 3,
+    "alzheimers": 3,
+    "alzheimer": 3,
+    "dementia": 3,
+}
+
+SUBJECT_ID_COLUMNS = ("subject_id", "ptid", "subject", "participant_id", "id")
+LABEL_COLUMNS = ("label", "diagnosis", "dx", "group", "class")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build balanced metadata splits for MM-DBGDGM")
@@ -46,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inference-count", type=int, default=1)
+    parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
     parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
 
@@ -64,6 +84,96 @@ def get_subject_id(path: Path) -> str:
     if not match:
         return ""
     return f"{match.group(1)}_S_{match.group(2)}"
+
+
+def normalize_subject_id(raw_value: object) -> str:
+    text = str(raw_value).strip()
+    match = re.search(r"(\d{3})[_.\-]S[_.\-](\d{4})", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return f"{match.group(1)}_S_{match.group(2)}"
+
+
+def parse_label_value(raw_value: object) -> Optional[int]:
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, (int, float)):
+        parsed_int = int(raw_value)
+        return parsed_int if parsed_int in {0, 1, 2, 3} else None
+
+    text = str(raw_value).strip().lower()
+    if not text:
+        return None
+
+    if text.isdigit():
+        parsed_int = int(text)
+        return parsed_int if parsed_int in {0, 1, 2, 3} else None
+
+    text_compact = text.replace(" ", "_")
+    for key, label_id in LABEL_NAME_TO_ID.items():
+        if key in text_compact:
+            return label_id
+    return None
+
+
+def find_first_matching_column(columns: Iterable[str], candidates: Tuple[str, ...]) -> Optional[str]:
+    lowered_to_original = {column.lower(): column for column in columns}
+    for candidate in candidates:
+        if candidate in lowered_to_original:
+            return lowered_to_original[candidate]
+    return None
+
+
+def discover_labels_csv(extracted_root: Path) -> Optional[Path]:
+    common_names = ["labels.csv", "metadata.csv", "manifest.csv"]
+    for name in common_names:
+        direct = extracted_root / name
+        if direct.exists() and direct.is_file():
+            return direct
+
+    for name in common_names:
+        matches = sorted(extracted_root.rglob(name))
+        if matches:
+            return matches[0]
+    return None
+
+
+def load_label_lookup(labels_csv: Path) -> Tuple[Dict[str, int], Dict[str, object]]:
+    LOGGER.info("Loading labels from CSV: %s", labels_csv)
+    df = pd.read_csv(labels_csv)
+
+    sid_col = find_first_matching_column(df.columns, SUBJECT_ID_COLUMNS)
+    label_col = find_first_matching_column(df.columns, LABEL_COLUMNS)
+
+    if sid_col is None or label_col is None:
+        raise ValueError(
+            f"Could not detect subject/label columns in {labels_csv}. "
+            f"Columns found: {list(df.columns)}"
+        )
+
+    lookup: Dict[str, int] = {}
+    skipped_rows = 0
+    for _, row in df.iterrows():
+        sid = normalize_subject_id(row[sid_col])
+        label = parse_label_value(row[label_col])
+        if not sid or label is None:
+            skipped_rows += 1
+            continue
+        lookup[sid] = label
+
+    diagnostics = {
+        "labels_csv": str(labels_csv),
+        "rows_total": int(len(df)),
+        "rows_loaded": int(len(lookup)),
+        "rows_skipped": int(skipped_rows),
+        "subject_column": sid_col,
+        "label_column": label_col,
+        "label_distribution": counter_to_dict(Counter(lookup.values())),
+    }
+    LOGGER.info("Loaded label lookup rows: %s", diagnostics["rows_loaded"])
+    LOGGER.info("Label lookup distribution: %s", diagnostics["label_distribution"])
+    return lookup, diagnostics
 
 
 def infer_label(path: Path) -> int:
@@ -94,7 +204,10 @@ def iter_leaf_dirs(root: Path) -> Iterable[Path]:
             yield candidate
 
 
-def pair_modalities(extracted_root: Path) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+def pair_modalities(
+    extracted_root: Path,
+    label_lookup: Optional[Dict[str, int]] = None,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     fmri_map: Dict[str, List[Path]] = defaultdict(list)
     smri_map: Dict[str, List[Path]] = defaultdict(list)
     label_map: Dict[str, int] = {}
@@ -104,6 +217,8 @@ def pair_modalities(extracted_root: Path) -> Tuple[List[Dict[str, object]], Dict
     skipped_missing_subject_id = 0
     heuristic_as_fmri = 0
     heuristic_as_smri = 0
+    labels_from_csv = 0
+    labels_from_path = 0
 
     for folder in iter_leaf_dirs(extracted_root):
         scanned_leaf_dirs += 1
@@ -132,10 +247,15 @@ def pair_modalities(extracted_root: Path) -> Tuple[List[Dict[str, object]], Dict
                 heuristic_as_smri += 1
 
         if sid not in label_map:
-            inferred_label, matched = infer_label_with_match(folder)
-            label_map[sid] = inferred_label
-            if not matched:
-                label_default_subjects.add(sid)
+            if label_lookup is not None and sid in label_lookup:
+                label_map[sid] = int(label_lookup[sid])
+                labels_from_csv += 1
+            else:
+                inferred_label, matched = infer_label_with_match(folder)
+                label_map[sid] = inferred_label
+                labels_from_path += 1
+                if not matched:
+                    label_default_subjects.add(sid)
 
     paired_ids = sorted(set(fmri_map) & set(smri_map))
     fmri_only_ids = sorted(set(fmri_map) - set(smri_map))
@@ -170,6 +290,7 @@ def pair_modalities(extracted_root: Path) -> Tuple[List[Dict[str, object]], Dict
 
     paired_label_counts = Counter(int(label_map.get(row["subject_id"], 0)) for row in rows)
     LOGGER.info("Paired label distribution: %s", counter_to_dict(paired_label_counts))
+    LOGGER.info("Label source usage -> csv: %s | path-inference: %s", labels_from_csv, labels_from_path)
     if label_default_subjects:
         LOGGER.warning(
             "Subjects with default label=0 (no label keyword match): %s (examples: %s)",
@@ -189,6 +310,8 @@ def pair_modalities(extracted_root: Path) -> Tuple[List[Dict[str, object]], Dict
         "smri_only_subjects": len(smri_only_ids),
         "label_default_subjects": len(label_default_subjects),
         "paired_label_distribution": counter_to_dict(paired_label_counts),
+        "labels_from_csv": labels_from_csv,
+        "labels_from_path": labels_from_path,
     }
     return rows, diagnostics
 
@@ -326,7 +449,24 @@ def main() -> None:
     LOGGER.info("Starting preprocessing")
     LOGGER.info("Extracted root: %s", extracted_root)
     LOGGER.info("Output root: %s", output_root)
-    rows, pairing_diagnostics = pair_modalities(extracted_root)
+
+    labels_csv_path: Optional[Path] = None
+    label_lookup: Optional[Dict[str, int]] = None
+    label_lookup_diagnostics: Dict[str, object] = {}
+    if args.labels_csv is not None:
+        labels_csv_path = args.labels_csv.expanduser().resolve()
+    else:
+        labels_csv_path = discover_labels_csv(extracted_root)
+
+    if labels_csv_path is not None and labels_csv_path.exists():
+        try:
+            label_lookup, label_lookup_diagnostics = load_label_lookup(labels_csv_path)
+        except Exception as exc:
+            LOGGER.warning("Could not load labels CSV (%s). Falling back to path inference. Error: %s", labels_csv_path, exc)
+    else:
+        LOGGER.warning("No labels CSV found. Falling back to path-based label inference.")
+
+    rows, pairing_diagnostics = pair_modalities(extracted_root, label_lookup=label_lookup)
 
     try:
         balanced_df, train_df, val_df, test_df, inference_df, split_diagnostics = build_balanced_splits(
@@ -340,6 +480,7 @@ def main() -> None:
         failure_summary = {
             "extracted_root": str(extracted_root),
             "output_root": str(output_root),
+            "label_lookup_diagnostics": label_lookup_diagnostics,
             "pairing_diagnostics": pairing_diagnostics,
             "hint": "If all labels are 0, update LABEL_RULES or provide label-aware folder naming.",
         }
@@ -377,6 +518,7 @@ def main() -> None:
             "inference": {str(k): int(v) for k, v in Counter(inference_df["label"]).items()},
         },
         "diagnostics": {
+            "label_lookup": label_lookup_diagnostics,
             "pairing": pairing_diagnostics,
             "splits": split_diagnostics,
         },
