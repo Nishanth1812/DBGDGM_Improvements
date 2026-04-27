@@ -52,8 +52,24 @@ LABEL_NAME_TO_ID = {
     "dementia": 3,
 }
 
-SUBJECT_ID_COLUMNS = ("subject_id", "ptid", "subject", "participant_id", "id")
-LABEL_COLUMNS = ("label", "diagnosis", "dx", "group", "class")
+SUBJECT_ID_COLUMNS = (
+    "subject_id",
+    "ptid",
+    "subject",
+    "participant_id",
+    "participant",
+    "id",
+    "image_id",
+)
+LABEL_COLUMNS = (
+    "label",
+    "diagnosis",
+    "dx",
+    "dx_bl",
+    "group",
+    "class",
+    "research_group",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inference-count", type=int, default=1)
     parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
+    parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
+    parser.add_argument("--skip-balancing", action="store_true", help="Skip balanced splitting; use all data as single train split")
     parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
 
@@ -125,22 +143,37 @@ def find_first_matching_column(columns: Iterable[str], candidates: Tuple[str, ..
     return None
 
 
-def discover_labels_csv(extracted_root: Path) -> Optional[Path]:
-    common_names = ["labels.csv", "metadata.csv", "manifest.csv"]
-    for name in common_names:
-        direct = extracted_root / name
-        if direct.exists() and direct.is_file():
-            return direct
+def discover_label_csv_candidates(extracted_root: Path) -> List[Path]:
+    candidate_names = [
+        "labels.csv",
+        "metadata.csv",
+        "manifest.csv",
+        "diagnosis.csv",
+        "dx.csv",
+    ]
+    search_roots: List[Path] = [extracted_root]
+    if extracted_root.parent != extracted_root:
+        search_roots.append(extracted_root.parent)
 
-    for name in common_names:
-        matches = sorted(extracted_root.rglob(name))
-        if matches:
-            return matches[0]
-    return None
+    discovered: Dict[str, Path] = {}
+    for root in search_roots:
+        if not root.exists():
+            continue
+
+        for name in candidate_names:
+            direct = root / name
+            if direct.exists() and direct.is_file():
+                discovered[str(direct.resolve())] = direct.resolve()
+
+        for pattern in ("*label*.csv", "*meta*.csv", "*manifest*.csv", "*diag*.csv", "*dx*.csv"):
+            for match in root.rglob(pattern):
+                if match.is_file():
+                    discovered[str(match.resolve())] = match.resolve()
+
+    return sorted(discovered.values())
 
 
 def load_label_lookup(labels_csv: Path) -> Tuple[Dict[str, int], Dict[str, object]]:
-    LOGGER.info("Loading labels from CSV: %s", labels_csv)
     df = pd.read_csv(labels_csv)
 
     sid_col = find_first_matching_column(df.columns, SUBJECT_ID_COLUMNS)
@@ -171,9 +204,72 @@ def load_label_lookup(labels_csv: Path) -> Tuple[Dict[str, int], Dict[str, objec
         "label_column": label_col,
         "label_distribution": counter_to_dict(Counter(lookup.values())),
     }
-    LOGGER.info("Loaded label lookup rows: %s", diagnostics["rows_loaded"])
-    LOGGER.info("Label lookup distribution: %s", diagnostics["label_distribution"])
     return lookup, diagnostics
+
+
+def resolve_label_lookup(
+    extracted_root: Path,
+    explicit_labels_csv: Optional[Path],
+    paired_subject_ids: List[str],
+) -> Tuple[Optional[Dict[str, int]], Dict[str, object]]:
+    if explicit_labels_csv is not None:
+        explicit_path = explicit_labels_csv.expanduser().resolve()
+        if not explicit_path.exists():
+            raise FileNotFoundError(f"labels CSV does not exist: {explicit_path}")
+
+        LOGGER.info("Using explicit labels CSV: %s", explicit_path)
+        lookup, diagnostics = load_label_lookup(explicit_path)
+        overlap = sum(1 for sid in paired_subject_ids if sid in lookup)
+        diagnostics["paired_subject_overlap"] = int(overlap)
+        LOGGER.info("Explicit labels overlap with paired subjects: %s/%s", overlap, len(paired_subject_ids))
+        return lookup, {"selected": diagnostics, "candidates": [diagnostics]}
+
+    candidates = discover_label_csv_candidates(extracted_root)
+    if not candidates:
+        LOGGER.warning("No candidate labels CSV found near extracted data.")
+        return None, {"selected": {}, "candidates": []}
+
+    LOGGER.info("Found %s candidate metadata CSV file(s)", len(candidates))
+    evaluated: List[Dict[str, object]] = []
+    best_lookup: Optional[Dict[str, int]] = None
+    best_diag: Optional[Dict[str, object]] = None
+    best_score: Tuple[int, int, int] = (-1, -1, -1)
+
+    for candidate in candidates:
+        try:
+            lookup, diag = load_label_lookup(candidate)
+        except Exception as exc:
+            evaluated.append({"labels_csv": str(candidate), "error": str(exc)})
+            continue
+
+        overlap = sum(1 for sid in paired_subject_ids if sid in lookup)
+        class_count = len(set(lookup.values()))
+        loaded_rows = int(diag.get("rows_loaded", 0))
+        score = (class_count, overlap, loaded_rows)
+
+        diag = dict(diag)
+        diag["paired_subject_overlap"] = int(overlap)
+        diag["class_count"] = int(class_count)
+        diag["score"] = list(score)
+        evaluated.append(diag)
+
+        if score > best_score:
+            best_score = score
+            best_lookup = lookup
+            best_diag = diag
+
+    if best_lookup is None:
+        LOGGER.warning("Could not parse any candidate labels CSV. Falling back to path-based label inference.")
+        return None, {"selected": {}, "candidates": evaluated}
+
+    LOGGER.info(
+        "Selected labels CSV: %s | classes=%s | overlap=%s | loaded_rows=%s",
+        best_diag.get("labels_csv"),
+        best_diag.get("class_count"),
+        best_diag.get("paired_subject_overlap"),
+        best_diag.get("rows_loaded"),
+    )
+    return best_lookup, {"selected": best_diag, "candidates": evaluated}
 
 
 def infer_label(path: Path) -> int:
@@ -364,7 +460,19 @@ def build_balanced_splits(
     if len(df) <= inference_count:
         raise ValueError("Not enough samples to set aside inference sample(s).")
 
-    inference_indices = rng.sample(list(df.index), k=inference_count)
+    # Keep inference holdout class-aware so we do not accidentally remove the only sample of a class.
+    mutable_counts = Counter(df["label"]) if "label" in df.columns else Counter()
+    available_indices = list(df.index)
+    inference_indices: List[int] = []
+    for _ in range(inference_count):
+        eligible = [idx for idx in available_indices if mutable_counts[int(df.loc[idx, "label"])] > 1]
+        pool = eligible if eligible else available_indices
+        chosen = rng.choice(pool)
+        inference_indices.append(chosen)
+        chosen_label = int(df.loc[chosen, "label"])
+        mutable_counts[chosen_label] -= 1
+        available_indices.remove(chosen)
+
     inference_df = df.loc[inference_indices].reset_index(drop=True)
     remaining_df = df.drop(index=inference_indices).reset_index(drop=True)
 
@@ -431,6 +539,15 @@ def build_balanced_splits(
     return balanced_df, train_df, val_df, test_df, inference_df, diagnostics
 
 
+def auto_generate_labels_csv(paired_subject_ids: List[str], seed: int) -> Dict[str, int]:
+    """Generate a default labels CSV (all CN/0) when no diagnosis metadata available."""
+    LOGGER.warning(
+        "No diagnosis labels found. Auto-generating labels CSV with all subjects as CN (label=0). "
+        "For true balanced training, provide a labels CSV via --labels-csv."
+    )
+    return {sid: 0 for sid in paired_subject_ids}
+
+
 def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
@@ -450,23 +567,44 @@ def main() -> None:
     LOGGER.info("Extracted root: %s", extracted_root)
     LOGGER.info("Output root: %s", output_root)
 
-    labels_csv_path: Optional[Path] = None
-    label_lookup: Optional[Dict[str, int]] = None
-    label_lookup_diagnostics: Dict[str, object] = {}
-    if args.labels_csv is not None:
-        labels_csv_path = args.labels_csv.expanduser().resolve()
-    else:
-        labels_csv_path = discover_labels_csv(extracted_root)
+    # First pass: build paired IDs so label CSV candidates can be scored by actual overlap.
+    rows_without_lookup, _ = pair_modalities(extracted_root, label_lookup=None)
+    paired_subject_ids = [str(row["subject_id"]) for row in rows_without_lookup]
 
-    if labels_csv_path is not None and labels_csv_path.exists():
-        try:
-            label_lookup, label_lookup_diagnostics = load_label_lookup(labels_csv_path)
-        except Exception as exc:
-            LOGGER.warning("Could not load labels CSV (%s). Falling back to path inference. Error: %s", labels_csv_path, exc)
-    else:
-        LOGGER.warning("No labels CSV found. Falling back to path-based label inference.")
+    label_lookup_diagnostics: Dict[str, object] = {}
+    label_lookup: Optional[Dict[str, int]] = None
+    try:
+        label_lookup, label_lookup_diagnostics = resolve_label_lookup(
+            extracted_root=extracted_root,
+            explicit_labels_csv=args.labels_csv,
+            paired_subject_ids=paired_subject_ids,
+        )
+    except Exception as exc:
+        LOGGER.warning("Label CSV resolution failed: %s", exc)
+
+    if label_lookup is None:
+        if args.skip_balancing:
+            LOGGER.warning("Skipping balanced splitting (--skip-balancing). Using all data as single split.")
+            label_lookup = auto_generate_labels_csv(paired_subject_ids, args.seed)
+        else:
+            LOGGER.warning(
+                "No multi-class labels available. Falling back to path-based label inference which will likely "
+                "result in single-class data. Use --skip-balancing to accept single-class data, or provide --labels-csv."
+            )
 
     rows, pairing_diagnostics = pair_modalities(extracted_root, label_lookup=label_lookup)
+
+    if args.skip_balancing:
+        LOGGER.info("Skip-balancing mode: using all data as single train split (no val/test)")
+        LOGGER.info("Total subjects: %s", len(rows))
+        df = pd.DataFrame(rows)
+        train_df = df
+        val_df = df.iloc[:0].copy()
+        test_df = df.iloc[:0].copy()
+        inference_df = df.iloc[:0].copy()
+        balanced_df = df
+        split_diagnostics = {}
+    else:
 
     try:
         balanced_df, train_df, val_df, test_df, inference_df, split_diagnostics = build_balanced_splits(
@@ -477,17 +615,27 @@ def main() -> None:
             val_ratio=args.val_ratio,
         )
     except Exception:
+        raise
+
+    if args.skip_balancing:
+        LOGGER.info("Wrote all data to train_metadata.csv (validation/test empty)")
+    else:
+        LOGGER.info("Wrote balanced splits to train/val/test metadata CSVs")
+
+    if not args.skip_balancing:
         failure_summary = {
             "extracted_root": str(extracted_root),
             "output_root": str(output_root),
             "label_lookup_diagnostics": label_lookup_diagnostics,
             "pairing_diagnostics": pairing_diagnostics,
-            "hint": "If all labels are 0, update LABEL_RULES or provide label-aware folder naming.",
+            "hint": "Provide --labels-csv with diagnosis labels for paired subjects, use --skip-balancing, or adjust LABEL_RULES.",
         }
         failure_path = output_root / "split_failure_diagnostics.json"
         failure_path.write_text(json.dumps(failure_summary, indent=2), encoding="utf-8")
         LOGGER.error("Wrote failure diagnostics to %s", failure_path)
         raise
+    else:
+        return ()
 
     all_path = output_root / "all_balanced_metadata.csv"
     train_path = output_root / "train_metadata.csv"
