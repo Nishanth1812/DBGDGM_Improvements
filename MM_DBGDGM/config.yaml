@@ -1,0 +1,37 @@
+data:
+  n_rois: 90
+  n_timepoints: 200
+  n_features_smri: 4
+
+preprocessing:
+  window_size: 30
+  window_stride: 5
+  top_edge_percent: 0.20
+
+model:
+  gat_hidden_dim: 32
+  gat_heads: 8
+  lstm_hidden_dim: 256
+  latent_dim: 128
+  dropout: 0.4
+  beta: 2.0
+
+training:
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  batch_size: 8
+  epochs: 100
+  patience: 15
+  lambda_vae: 0.1
+  warmup_epochs: 20
+  k_folds: 5
+  seed: 42
+
+inference:
+  uncertainty_threshold: 0.5
+
+labels:
+  0: CN
+  1: eMCI
+  2: lMCI
+  3: AD

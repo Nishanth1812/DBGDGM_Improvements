@@ -14,10 +14,8 @@ import inspect
 import os
 import json
 import logging
-import re
 import shutil
 import sys
-import warnings
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -737,6 +735,13 @@ def main() -> Dict[str, Any]:
     total_params = sum(parameter.numel() for parameter in model.parameters())
     trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     logger.info(f"Model parameters - Total: {total_params:,}, Trainable: {trainable_params:,}")
+    if hasattr(model, "count_parameters"):
+        try:
+            parameter_breakdown = model.count_parameters()
+            for module_name, module_params in parameter_breakdown.items():
+                logger.info(f"Parameter breakdown - {module_name}: {module_params:,}")
+        except Exception as exc:
+            logger.warning(f"Could not compute parameter breakdown: {exc}")
 
     frozen_module_names: List[str] = []
     if args.train_only_smri:

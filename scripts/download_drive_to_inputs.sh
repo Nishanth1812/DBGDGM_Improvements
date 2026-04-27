@@ -14,6 +14,7 @@ Options:
   --dest DIR           Destination directory (default: /root/mm_dbgdgm_inputs)
   --log-file FILE      Log file path (default: <dest>/drive_download_<timestamp>.log)
   --no-install         Fail if gdown is missing (do not auto-install)
+  --venv-dir DIR       Python virtualenv for gdown (default: /root/.venvs/gdown)
   --help               Show this help text
 
 Examples:
@@ -31,6 +32,7 @@ FOLDER_ID=""
 DEST_DIR="/root/mm_dbgdgm_inputs"
 LOG_FILE=""
 AUTO_INSTALL=1
+VENV_DIR="/root/.venvs/gdown"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +55,10 @@ while [[ $# -gt 0 ]]; do
     --no-install)
       AUTO_INSTALL=0
       shift
+      ;;
+    --venv-dir)
+      VENV_DIR="$2"
+      shift 2
       ;;
     --help|-h)
       usage
@@ -103,12 +109,31 @@ if [[ -n "$FOLDER_ID" ]]; then
   FOLDER_URL="https://drive.google.com/drive/folders/${FOLDER_ID}"
 fi
 
-if ! "$PYTHON_BIN" -m gdown --help >/dev/null 2>&1; then
+if [[ ! -d "$VENV_DIR" ]]; then
   if [[ "$AUTO_INSTALL" -eq 1 ]]; then
-    log "gdown not found; installing with pip"
-    "$PYTHON_BIN" -m pip install --upgrade pip gdown | tee -a "$LOG_FILE"
+    log "Creating virtual environment: $VENV_DIR"
+    if ! "$PYTHON_BIN" -m venv "$VENV_DIR" 2>>"$LOG_FILE"; then
+      log "python -m venv failed. Installing python3-venv via apt."
+      apt-get update -y | tee -a "$LOG_FILE"
+      apt-get install -y python3-venv | tee -a "$LOG_FILE"
+      "$PYTHON_BIN" -m venv "$VENV_DIR"
+    fi
   else
-    log "ERROR: gdown is not installed and --no-install was set"
+    log "ERROR: venv not found and --no-install was set: $VENV_DIR"
+    exit 1
+  fi
+fi
+
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+
+if ! python -m gdown --help >/dev/null 2>&1; then
+  if [[ "$AUTO_INSTALL" -eq 1 ]]; then
+    log "gdown not found in venv; installing"
+    python -m pip install --upgrade pip gdown | tee -a "$LOG_FILE"
+  else
+    log "ERROR: gdown is not installed in venv and --no-install was set"
+    deactivate || true
     exit 1
   fi
 fi
@@ -119,11 +144,12 @@ log "Folder URL: $FOLDER_URL"
 log "Destination: $DEST_DIR"
 
 set +e
-"$PYTHON_BIN" -m gdown --folder --continue --remaining-ok "$FOLDER_URL" 2>&1 | tee -a "$LOG_FILE"
+python -m gdown --folder --continue "$FOLDER_URL" 2>&1 | tee -a "$LOG_FILE"
 CMD_EXIT=${PIPESTATUS[0]}
 set -e
 
 popd >/dev/null
+deactivate || true
 
 if [[ "$CMD_EXIT" -ne 0 ]]; then
   log "ERROR: Download failed with exit code $CMD_EXIT"
@@ -132,4 +158,3 @@ fi
 
 log "Download completed successfully"
 log "Files are available under: $DEST_DIR"
-

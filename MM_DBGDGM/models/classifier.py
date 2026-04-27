@@ -1,66 +1,30 @@
-"""
-Classification Head
-Extracted from VAE module for independent downstream disease staging.
-"""
-
 import torch
 import torch.nn as nn
 
+
 class ClassificationHead(nn.Module):
     """
-    Classification head for disease diagnosis.
-    Uses latent representation (e.g. μ from VAE or z_fused) to predict status.
+    Maps latent mu -> 4-class logits.
+
+    Architecture:
+        Linear(128 -> 256) -> BatchNorm -> ReLU -> Dropout(0.4)
+        Linear(256 -> 128) -> BatchNorm -> ReLU -> Dropout(0.4)
+        Linear(128 -> 4)
     """
-    
-    def __init__(
-        self,
-        latent_dim: int,
-        num_classes: int = 4,  # CN, eMCI, lMCI, AD
-        hidden_dims: list = [512, 256],
-        dropout: float = 0.2
-    ):
+
+    def __init__(self, latent_dim: int = 128, hidden_dim: int = 256, num_classes: int = 4, dropout: float = 0.4):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_classes = num_classes
-        
-        # Build classifier layers
-        layers = []
-        prev_dim = latent_dim
-        
-        for i, hidden_dim in enumerate(hidden_dims):
-            if i == 0:
-                layers.append(nn.Linear(prev_dim, hidden_dim))
-            else:
-                layers.extend([
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(prev_dim, hidden_dim)
-                ])
-            
-            if i < len(hidden_dims) - 1:
-                layers.extend([
-                    nn.ReLU(),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.Dropout(dropout)
-                ])
-            
-            prev_dim = hidden_dim
-        
-        layers.extend([
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(prev_dim, num_classes)
-        ])
-        
-        self.classifier = nn.Sequential(*layers)
-    
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [batch_size, latent_dim]
-        
-        Returns:
-            logits: [batch_size, num_classes]
-        """
-        logits = self.classifier(z)
-        return logits
+            nn.Linear(hidden_dim, latent_dim),
+            nn.BatchNorm1d(latent_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim, num_classes),
+        )
+
+    def forward(self, mu: torch.Tensor):
+        return self.net(mu)
