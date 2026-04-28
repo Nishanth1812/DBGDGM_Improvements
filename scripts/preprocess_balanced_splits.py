@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Create balanced train/val/test metadata from extracted ADNI-style folders.
+"""Create train/val/test metadata from extracted ADNI-style folders.
 
-The script scans extracted folders, pairs fMRI and sMRI by subject ID, infers class
-labels from folder names, holds out one random sample for inference, balances the
-remaining set across labels, and writes split CSV files.
+- Default mode: requires at least two classes and creates class-balanced splits.
+- Fallback mode (--skip-balancing): writes all paired subjects to train split only.
 """
 
 from __future__ import annotations
@@ -53,27 +52,15 @@ LABEL_NAME_TO_ID = {
 }
 
 SUBJECT_ID_COLUMNS = (
-    "subject_id",
-    "ptid",
-    "subject",
-    "participant_id",
-    "participant",
-    "id",
-    "image_id",
+    "subject_id", "ptid", "subject", "participant_id", "participant", "id", "image_id",
 )
 LABEL_COLUMNS = (
-    "label",
-    "diagnosis",
-    "dx",
-    "dx_bl",
-    "group",
-    "class",
-    "research_group",
+    "label", "diagnosis", "dx", "dx_bl", "group", "class", "research_group",
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build balanced metadata splits for MM-DBGDGM")
+    parser = argparse.ArgumentParser(description="Build metadata splits for MM-DBGDGM")
     parser.add_argument("--extracted-root", type=Path, default=Path("/root/mm_dbgdgm_inputs/extracted"))
     parser.add_argument("--output-root", type=Path, default=Path("/root/mm_dbgdgm_inputs/preprocessed"))
     parser.add_argument("--train-ratio", type=float, default=0.7)
@@ -82,8 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inference-count", type=int, default=1)
     parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
-    parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
-    parser.add_argument("--skip-balancing", action="store_true", help="Skip balanced splitting; use all data as single train split")
+    parser.add_argument("--skip-balancing", action="store_true", help="Skip balancing and write all data to train split")
     parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
 
@@ -115,18 +101,16 @@ def normalize_subject_id(raw_value: object) -> str:
 def parse_label_value(raw_value: object) -> Optional[int]:
     if raw_value is None:
         return None
-
     if isinstance(raw_value, (int, float)):
-        parsed_int = int(raw_value)
-        return parsed_int if parsed_int in {0, 1, 2, 3} else None
+        label_id = int(raw_value)
+        return label_id if label_id in {0, 1, 2, 3} else None
 
     text = str(raw_value).strip().lower()
     if not text:
         return None
-
     if text.isdigit():
-        parsed_int = int(text)
-        return parsed_int if parsed_int in {0, 1, 2, 3} else None
+        label_id = int(text)
+        return label_id if label_id in {0, 1, 2, 3} else None
 
     text_compact = text.replace(" ", "_")
     for key, label_id in LABEL_NAME_TO_ID.items():
@@ -136,7 +120,7 @@ def parse_label_value(raw_value: object) -> Optional[int]:
 
 
 def find_first_matching_column(columns: Iterable[str], candidates: Tuple[str, ...]) -> Optional[str]:
-    lowered_to_original = {column.lower(): column for column in columns}
+    lowered_to_original = {col.lower(): col for col in columns}
     for candidate in candidates:
         if candidate in lowered_to_original:
             return lowered_to_original[candidate]
@@ -144,13 +128,7 @@ def find_first_matching_column(columns: Iterable[str], candidates: Tuple[str, ..
 
 
 def discover_label_csv_candidates(extracted_root: Path) -> List[Path]:
-    candidate_names = [
-        "labels.csv",
-        "metadata.csv",
-        "manifest.csv",
-        "diagnosis.csv",
-        "dx.csv",
-    ]
+    candidate_names = ["labels.csv", "metadata.csv", "manifest.csv", "diagnosis.csv", "dx.csv"]
     search_roots: List[Path] = [extracted_root]
     if extracted_root.parent != extracted_root:
         search_roots.append(extracted_root.parent)
@@ -178,12 +156,8 @@ def load_label_lookup(labels_csv: Path) -> Tuple[Dict[str, int], Dict[str, objec
 
     sid_col = find_first_matching_column(df.columns, SUBJECT_ID_COLUMNS)
     label_col = find_first_matching_column(df.columns, LABEL_COLUMNS)
-
     if sid_col is None or label_col is None:
-        raise ValueError(
-            f"Could not detect subject/label columns in {labels_csv}. "
-            f"Columns found: {list(df.columns)}"
-        )
+        raise ValueError(f"Could not detect subject/label columns in {labels_csv}. Columns: {list(df.columns)}")
 
     lookup: Dict[str, int] = {}
     skipped_rows = 0
@@ -217,11 +191,10 @@ def resolve_label_lookup(
         if not explicit_path.exists():
             raise FileNotFoundError(f"labels CSV does not exist: {explicit_path}")
 
-        LOGGER.info("Using explicit labels CSV: %s", explicit_path)
         lookup, diagnostics = load_label_lookup(explicit_path)
         overlap = sum(1 for sid in paired_subject_ids if sid in lookup)
         diagnostics["paired_subject_overlap"] = int(overlap)
-        LOGGER.info("Explicit labels overlap with paired subjects: %s/%s", overlap, len(paired_subject_ids))
+        LOGGER.info("Using explicit labels CSV: %s (overlap %s/%s)", explicit_path, overlap, len(paired_subject_ids))
         return lookup, {"selected": diagnostics, "candidates": [diagnostics]}
 
     candidates = discover_label_csv_candidates(extracted_root)
@@ -259,7 +232,6 @@ def resolve_label_lookup(
             best_diag = diag
 
     if best_lookup is None:
-        LOGGER.warning("Could not parse any candidate labels CSV. Falling back to path-based label inference.")
         return None, {"selected": {}, "candidates": evaluated}
 
     LOGGER.info(
@@ -270,14 +242,6 @@ def resolve_label_lookup(
         best_diag.get("rows_loaded"),
     )
     return best_lookup, {"selected": best_diag, "candidates": evaluated}
-
-
-def infer_label(path: Path) -> int:
-    normalized = str(path).lower().replace("\\", "/")
-    for label, keywords in LABEL_RULES:
-        if any(keyword in normalized for keyword in keywords):
-            return label
-    return 0
 
 
 def infer_label_with_match(path: Path) -> Tuple[int, bool]:
@@ -354,26 +318,11 @@ def pair_modalities(
                     label_default_subjects.add(sid)
 
     paired_ids = sorted(set(fmri_map) & set(smri_map))
-    fmri_only_ids = sorted(set(fmri_map) - set(smri_map))
-    smri_only_ids = sorted(set(smri_map) - set(fmri_map))
-
-    LOGGER.info("Leaf folders scanned: %s", scanned_leaf_dirs)
-    LOGGER.info("Folders skipped (no subject id): %s", skipped_missing_subject_id)
-    LOGGER.info("Subjects with fMRI candidates: %s", len(fmri_map))
-    LOGGER.info("Subjects with sMRI candidates: %s", len(smri_map))
-    LOGGER.info("Paired subjects (both modalities): %s", len(paired_ids))
-    LOGGER.info("Heuristic-only modality assignment -> fMRI: %s | sMRI: %s", heuristic_as_fmri, heuristic_as_smri)
-    if fmri_only_ids:
-        LOGGER.warning("fMRI-only subjects: %s (examples: %s)", len(fmri_only_ids), fmri_only_ids[:5])
-    if smri_only_ids:
-        LOGGER.warning("sMRI-only subjects: %s (examples: %s)", len(smri_only_ids), smri_only_ids[:5])
-
     rows: List[Dict[str, object]] = []
     for sid in paired_ids:
         fmri_path = fmri_map[sid][0]
         smri_path = smri_map[sid][0]
         fmri_npy = fmri_path / "fmri.npy"
-
         rows.append(
             {
                 "subject_id": sid,
@@ -385,26 +334,19 @@ def pair_modalities(
         )
 
     paired_label_counts = Counter(int(label_map.get(row["subject_id"], 0)) for row in rows)
+    LOGGER.info("Leaf folders scanned: %s", scanned_leaf_dirs)
+    LOGGER.info("Folders skipped (no subject id): %s", skipped_missing_subject_id)
+    LOGGER.info("Paired subjects (both modalities): %s", len(paired_ids))
+    LOGGER.info("Heuristic modality assignment -> fMRI: %s | sMRI: %s", heuristic_as_fmri, heuristic_as_smri)
     LOGGER.info("Paired label distribution: %s", counter_to_dict(paired_label_counts))
     LOGGER.info("Label source usage -> csv: %s | path-inference: %s", labels_from_csv, labels_from_path)
     if label_default_subjects:
-        LOGGER.warning(
-            "Subjects with default label=0 (no label keyword match): %s (examples: %s)",
-            len(label_default_subjects),
-            sorted(label_default_subjects)[:5],
-        )
+        LOGGER.warning("Subjects with default label=0 (examples: %s)", sorted(label_default_subjects)[:5])
 
     diagnostics = {
         "leaf_dirs_scanned": scanned_leaf_dirs,
         "skipped_missing_subject_id": skipped_missing_subject_id,
-        "heuristic_as_fmri": heuristic_as_fmri,
-        "heuristic_as_smri": heuristic_as_smri,
-        "subjects_with_fmri": len(fmri_map),
-        "subjects_with_smri": len(smri_map),
         "paired_subjects": len(paired_ids),
-        "fmri_only_subjects": len(fmri_only_ids),
-        "smri_only_subjects": len(smri_only_ids),
-        "label_default_subjects": len(label_default_subjects),
         "paired_label_distribution": counter_to_dict(paired_label_counts),
         "labels_from_csv": labels_from_csv,
         "labels_from_path": labels_from_path,
@@ -420,12 +362,9 @@ def per_class_split_count(class_size: int, train_ratio: float, val_ratio: float)
     val = int(class_size * val_ratio)
     test = class_size - train - val
 
-    if train == 0:
-        train = 1
-    if val == 0:
-        val = 1
-    if test == 0:
-        test = 1
+    train = max(train, 1)
+    val = max(val, 1)
+    test = max(test, 1)
 
     while train + val + test > class_size:
         if train >= val and train >= test and train > 1:
@@ -460,8 +399,7 @@ def build_balanced_splits(
     if len(df) <= inference_count:
         raise ValueError("Not enough samples to set aside inference sample(s).")
 
-    # Keep inference holdout class-aware so we do not accidentally remove the only sample of a class.
-    mutable_counts = Counter(df["label"]) if "label" in df.columns else Counter()
+    mutable_counts = Counter(df["label"])
     available_indices = list(df.index)
     inference_indices: List[int] = []
     for _ in range(inference_count):
@@ -476,14 +414,7 @@ def build_balanced_splits(
     inference_df = df.loc[inference_indices].reset_index(drop=True)
     remaining_df = df.drop(index=inference_indices).reset_index(drop=True)
 
-    before_holdout_counts = Counter(df["label"]) if "label" in df.columns else Counter()
-    after_holdout_counts = Counter(remaining_df["label"]) if "label" in remaining_df.columns else Counter()
-    inference_counts = Counter(inference_df["label"]) if "label" in inference_df.columns else Counter()
-
-    LOGGER.info("Label distribution before inference holdout: %s", counter_to_dict(before_holdout_counts))
-    LOGGER.info("Label distribution after inference holdout: %s", counter_to_dict(after_holdout_counts))
-    LOGGER.info("Inference holdout distribution: %s", counter_to_dict(inference_counts))
-
+    after_holdout_counts = Counter(remaining_df["label"])
     class_groups = {
         int(label): group.sample(frac=1.0, random_state=seed).reset_index(drop=True)
         for label, group in remaining_df.groupby("label")
@@ -491,61 +422,42 @@ def build_balanced_splits(
     if len(class_groups) < 2:
         raise ValueError(
             "Need at least two classes for balanced splitting. "
-            f"Observed labels after inference holdout: {counter_to_dict(after_holdout_counts)}. "
-            "This usually means folder names do not encode diagnosis labels for LABEL_RULES."
+            f"Observed labels after inference holdout: {counter_to_dict(after_holdout_counts)}"
         )
 
     min_count = min(len(group) for group in class_groups.values())
     if min_count < 3:
         raise ValueError(
-            "At least 3 samples per class are required after holding inference sample(s). "
-            f"Observed per-class counts: {counter_to_dict(Counter(remaining_df['label']))}"
+            "At least 3 samples per class are required after inference holdout. "
+            f"Observed: {counter_to_dict(after_holdout_counts)}"
         )
 
     trimmed_groups = {label: group.iloc[:min_count].copy() for label, group in class_groups.items()}
     balanced_df = pd.concat(trimmed_groups.values(), ignore_index=True)
 
-    train_chunks: List[pd.DataFrame] = []
-    val_chunks: List[pd.DataFrame] = []
-    test_chunks: List[pd.DataFrame] = []
-
     train_count, val_count, test_count = per_class_split_count(min_count, train_ratio, val_ratio)
-    LOGGER.info(
-        "Balanced per-class split counts -> train: %s, val: %s, test: %s (per class)",
-        train_count,
-        val_count,
-        test_count,
-    )
+    train_parts: List[pd.DataFrame] = []
+    val_parts: List[pd.DataFrame] = []
+    test_parts: List[pd.DataFrame] = []
 
     for _, group in sorted(trimmed_groups.items()):
-        train_chunks.append(group.iloc[:train_count])
-        val_chunks.append(group.iloc[train_count : train_count + val_count])
-        test_chunks.append(group.iloc[train_count + val_count : train_count + val_count + test_count])
+        train_parts.append(group.iloc[:train_count])
+        val_parts.append(group.iloc[train_count : train_count + val_count])
+        test_parts.append(group.iloc[train_count + val_count : train_count + val_count + test_count])
 
-    train_df = pd.concat(train_chunks, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    val_df = pd.concat(val_chunks, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    test_df = pd.concat(test_chunks, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    train_df = pd.concat(train_parts, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    val_df = pd.concat(val_parts, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    test_df = pd.concat(test_parts, ignore_index=True).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
     diagnostics = {
-        "label_distribution_before_holdout": counter_to_dict(before_holdout_counts),
+        "mode": "balanced",
+        "label_distribution_before_holdout": counter_to_dict(Counter(df["label"])),
         "label_distribution_after_holdout": counter_to_dict(after_holdout_counts),
-        "inference_distribution": counter_to_dict(inference_counts),
-        "balanced_distribution": counter_to_dict(Counter(balanced_df["label"])),
         "train_distribution": counter_to_dict(Counter(train_df["label"])),
         "val_distribution": counter_to_dict(Counter(val_df["label"])),
         "test_distribution": counter_to_dict(Counter(test_df["label"])),
     }
-
     return balanced_df, train_df, val_df, test_df, inference_df, diagnostics
-
-
-def auto_generate_labels_csv(paired_subject_ids: List[str], seed: int) -> Dict[str, int]:
-    """Generate a default labels CSV (all CN/0) when no diagnosis metadata available."""
-    LOGGER.warning(
-        "No diagnosis labels found. Auto-generating labels CSV with all subjects as CN (label=0). "
-        "For true balanced training, provide a labels CSV via --labels-csv."
-    )
-    return {sid: 0 for sid in paired_subject_ids}
 
 
 def main() -> None:
@@ -567,7 +479,6 @@ def main() -> None:
     LOGGER.info("Extracted root: %s", extracted_root)
     LOGGER.info("Output root: %s", output_root)
 
-    # First pass: build paired IDs so label CSV candidates can be scored by actual overlap.
     rows_without_lookup, _ = pair_modalities(extracted_root, label_lookup=None)
     paired_subject_ids = [str(row["subject_id"]) for row in rows_without_lookup]
 
@@ -582,31 +493,50 @@ def main() -> None:
     except Exception as exc:
         LOGGER.warning("Label CSV resolution failed: %s", exc)
 
-    if label_lookup is None:
-        if args.skip_balancing:
-            LOGGER.warning("Skipping balanced splitting (--skip-balancing). Using all data as single split.")
-            label_lookup = auto_generate_labels_csv(paired_subject_ids, args.seed)
-        else:
-            LOGGER.warning(
-                "No multi-class labels available. Falling back to path-based label inference which will likely "
-                "result in single-class data. Use --skip-balancing to accept single-class data, or provide --labels-csv."
-            )
-
     rows, pairing_diagnostics = pair_modalities(extracted_root, label_lookup=label_lookup)
+    df = pd.DataFrame(rows)
 
     if args.skip_balancing:
-        LOGGER.info("Skip-balancing mode: using all data as single train split (no val/test)")
-        LOGGER.info("Total subjects: %s", len(rows))
-        df = pd.DataFrame(rows)
-        train_df = df
-        val_df = df.iloc[:0].copy()
-        test_df = df.iloc[:0].copy()
-        inference_df = df.iloc[:0].copy()
-        balanced_df = df
-        split_diagnostics = {}
-    else:
+        LOGGER.warning("--skip-balancing enabled: writing all paired subjects to train split")
+        if df.empty:
+            raise ValueError("No paired subjects found; cannot create metadata splits.")
 
-    try:
+        shuffled = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+        inference_n = min(max(args.inference_count, 1), len(shuffled) - 1) if len(shuffled) > 1 else 0
+        inference_df = shuffled.iloc[:inference_n].copy()
+        remaining = shuffled.iloc[inference_n:].copy()
+
+        if len(remaining) < 3:
+            train_df = remaining.copy()
+            val_df = remaining.copy()
+            test_df = remaining.copy()
+        else:
+            val_n = max(1, int(len(remaining) * args.val_ratio))
+            test_n = max(1, int(len(remaining) * args.test_ratio))
+            train_n = len(remaining) - val_n - test_n
+            if train_n < 1:
+                train_n = 1
+                if val_n > test_n and val_n > 1:
+                    val_n -= 1
+                elif test_n > 1:
+                    test_n -= 1
+
+            train_df = remaining.iloc[:train_n].copy()
+            val_df = remaining.iloc[train_n : train_n + val_n].copy()
+            test_df = remaining.iloc[train_n + val_n : train_n + val_n + test_n].copy()
+
+            if val_df.empty:
+                val_df = train_df.iloc[:1].copy()
+            if test_df.empty:
+                test_df = train_df.iloc[:1].copy()
+
+        balanced_df = remaining.copy()
+        split_diagnostics = {
+            "mode": "skip_balancing",
+            "reason": "single_class_or_missing_labels",
+            "remaining_after_inference": int(len(remaining)),
+        }
+    else:
         balanced_df, train_df, val_df, test_df, inference_df, split_diagnostics = build_balanced_splits(
             rows=rows,
             seed=args.seed,
@@ -614,28 +544,6 @@ def main() -> None:
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
         )
-    except Exception:
-        raise
-
-    if args.skip_balancing:
-        LOGGER.info("Wrote all data to train_metadata.csv (validation/test empty)")
-    else:
-        LOGGER.info("Wrote balanced splits to train/val/test metadata CSVs")
-
-    if not args.skip_balancing:
-        failure_summary = {
-            "extracted_root": str(extracted_root),
-            "output_root": str(output_root),
-            "label_lookup_diagnostics": label_lookup_diagnostics,
-            "pairing_diagnostics": pairing_diagnostics,
-            "hint": "Provide --labels-csv with diagnosis labels for paired subjects, use --skip-balancing, or adjust LABEL_RULES.",
-        }
-        failure_path = output_root / "split_failure_diagnostics.json"
-        failure_path.write_text(json.dumps(failure_summary, indent=2), encoding="utf-8")
-        LOGGER.error("Wrote failure diagnostics to %s", failure_path)
-        raise
-    else:
-        return ()
 
     all_path = output_root / "all_balanced_metadata.csv"
     train_path = output_root / "train_metadata.csv"
@@ -653,17 +561,17 @@ def main() -> None:
         "extracted_root": str(extracted_root),
         "output_root": str(output_root),
         "seed": args.seed,
-        "inference_count": args.inference_count,
+        "skip_balancing": args.skip_balancing,
         "total_paired_subjects": len(rows),
         "balanced_subjects": len(balanced_df),
         "train_subjects": len(train_df),
         "val_subjects": len(val_df),
         "test_subjects": len(test_df),
         "label_distribution": {
-            "train": {str(k): int(v) for k, v in Counter(train_df["label"]).items()},
-            "val": {str(k): int(v) for k, v in Counter(val_df["label"]).items()},
-            "test": {str(k): int(v) for k, v in Counter(test_df["label"]).items()},
-            "inference": {str(k): int(v) for k, v in Counter(inference_df["label"]).items()},
+            "train": counter_to_dict(Counter(train_df["label"])) if not train_df.empty else {},
+            "val": counter_to_dict(Counter(val_df["label"])) if not val_df.empty else {},
+            "test": counter_to_dict(Counter(test_df["label"])) if not test_df.empty else {},
+            "inference": counter_to_dict(Counter(inference_df["label"])) if not inference_df.empty else {},
         },
         "diagnostics": {
             "label_lookup": label_lookup_diagnostics,
