@@ -475,6 +475,7 @@ def build_balanced_splits(
     inference_count: int,
     train_ratio: float,
     val_ratio: float,
+    test_ratio: float,
     balance_mode: str = "trim",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     rng = random.Random(seed)
@@ -684,6 +685,7 @@ def main() -> None:
             inference_count=args.inference_count,
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
             balance_mode=args.balance_mode,
         )
     
