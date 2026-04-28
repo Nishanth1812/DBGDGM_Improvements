@@ -47,6 +47,8 @@ LABEL_NAME_TO_ID = {
     "emci": 1,
     "early_mci": 1,
     "early-mci": 1,
+    "mci": 1,
+    "mild_cognitive_impairment": 1,
     "lmci": 2,
     "late_mci": 2,
     "late-mci": 2,

@@ -70,6 +70,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-count", type=int, default=1)
     parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
     parser.add_argument("--skip-balancing", action="store_true", help="Skip balancing and write all data to train split")
+    parser.add_argument("--balance-mode", type=str, default="trim", choices=("trim", "upsample"),
+                        help="How to balance classes: trim (reduce to smallest) or upsample (oversample minorities)")
+    parser.add_argument("--max-cn-ratio", type=float, default=None,
+                        help="Cap CN (label 0) to this fraction of total training set (e.g., 0.5 = max 50%%).")
     parser.add_argument("--log-level", type=str, default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
 
@@ -382,12 +386,82 @@ def per_class_split_count(class_size: int, train_ratio: float, val_ratio: float)
     return train, val, test
 
 
+def apply_cn_sample_limit(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    max_cn_ratio: Optional[float],
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    """Limit CN (label 0) samples in training set (by ratio) and redistribute excess to val/test."""
+    diagnostics: Dict[str, object] = {}
+    
+    if max_cn_ratio is None or max_cn_ratio <= 0 or max_cn_ratio > 1:
+        return train_df, val_df, test_df, diagnostics
+    
+    cn_mask_train = train_df["label"] == 0
+    cn_count_train = cn_mask_train.sum()
+    
+    # Calculate max_cn_samples from ratio based on total training set size
+    max_cn_samples = int(len(train_df) * max_cn_ratio)
+    
+    diagnostics["cn_limit_applied"] = True
+    diagnostics["cn_ratio_limit"] = float(max_cn_ratio)
+    diagnostics["cn_train_before_limit"] = int(cn_count_train)
+    diagnostics["cn_limit_samples"] = int(max_cn_samples)
+    
+    if cn_count_train <= max_cn_samples:
+        diagnostics["cn_removed"] = 0
+        return train_df, val_df, test_df, diagnostics
+    
+    # Separate CN and non-CN samples from training set
+    cn_samples_train = train_df[cn_mask_train].reset_index(drop=True)
+    non_cn_samples_train = train_df[~cn_mask_train].reset_index(drop=True)
+    
+    # Keep only max_cn_samples CN samples in training
+    rng = random.Random(seed)
+    cn_indices_to_keep = sorted(rng.sample(range(len(cn_samples_train)), max_cn_samples))
+    cn_samples_to_keep = cn_samples_train.iloc[cn_indices_to_keep].reset_index(drop=True)
+    cn_samples_to_redistribute = cn_samples_train.drop(cn_indices_to_keep).reset_index(drop=True)
+    
+    # Rebuild training set
+    train_df_new = pd.concat([non_cn_samples_train, cn_samples_to_keep], ignore_index=True)
+    train_df_new = train_df_new.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    
+    # Redistribute excess CN samples to val and test
+    cn_redistributed = len(cn_samples_to_redistribute)
+    val_addition = cn_redistributed // 2
+    test_addition = cn_redistributed - val_addition
+    
+    cn_for_val = cn_samples_to_redistribute.iloc[:val_addition].reset_index(drop=True)
+    cn_for_test = cn_samples_to_redistribute.iloc[val_addition:].reset_index(drop=True)
+    
+    val_df_new = pd.concat([val_df, cn_for_val], ignore_index=True)
+    test_df_new = pd.concat([test_df, cn_for_test], ignore_index=True)
+    
+    val_df_new = val_df_new.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    test_df_new = test_df_new.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    
+    diagnostics["cn_removed"] = int(cn_redistributed)
+    diagnostics["cn_added_to_val"] = int(val_addition)
+    diagnostics["cn_added_to_test"] = int(test_addition)
+    diagnostics["cn_train_after_limit"] = int(max_cn_samples)
+    
+    LOGGER.info(
+        "CN sample limiting applied: kept %s in train, redistributed %s (val: %s | test: %s)",
+        max_cn_samples, cn_redistributed, val_addition, test_addition
+    )
+    
+    return train_df_new, val_df_new, test_df_new, diagnostics
+
+
 def build_balanced_splits(
     rows: List[Dict[str, object]],
     seed: int,
     inference_count: int,
     train_ratio: float,
     val_ratio: float,
+    balance_mode: str = "trim",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     rng = random.Random(seed)
     df = pd.DataFrame(rows)
@@ -415,32 +489,48 @@ def build_balanced_splits(
     remaining_df = df.drop(index=inference_indices).reset_index(drop=True)
 
     after_holdout_counts = Counter(remaining_df["label"])
-    class_groups = {
-        int(label): group.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-        for label, group in remaining_df.groupby("label")
-    }
+    # group by label without shuffling yet
+    class_groups = {int(label): group.reset_index(drop=True) for label, group in remaining_df.groupby("label")}
     if len(class_groups) < 2:
         raise ValueError(
             "Need at least two classes for balanced splitting. "
             f"Observed labels after inference holdout: {counter_to_dict(after_holdout_counts)}"
         )
 
-    min_count = min(len(group) for group in class_groups.values())
-    if min_count < 3:
-        raise ValueError(
-            "At least 3 samples per class are required after inference holdout. "
-            f"Observed: {counter_to_dict(after_holdout_counts)}"
-        )
+    # Balance according to chosen mode
+    if balance_mode == "trim":
+        min_count = min(len(group) for group in class_groups.values())
+        if min_count < 3:
+            raise ValueError(
+                "At least 3 samples per class are required after inference holdout. "
+                f"Observed: {counter_to_dict(after_holdout_counts)}"
+            )
+        trimmed_groups = {label: group.sample(frac=1.0, random_state=seed).iloc[:min_count].copy() for label, group in class_groups.items()}
+        balanced_df = pd.concat(trimmed_groups.values(), ignore_index=True)
+        per_class_size = min_count
+        working_groups = trimmed_groups
+    elif balance_mode == "upsample":
+        max_count = max(len(group) for group in class_groups.values())
+        target = max(3, max_count)
+        upsampled_groups = {}
+        for label, group in class_groups.items():
+            if len(group) >= target:
+                upsampled = group.sample(n=target, replace=False, random_state=seed).reset_index(drop=True)
+            else:
+                upsampled = group.sample(n=target, replace=True, random_state=seed).reset_index(drop=True)
+            upsampled_groups[label] = upsampled
+        balanced_df = pd.concat(upsampled_groups.values(), ignore_index=True)
+        per_class_size = target
+        working_groups = upsampled_groups
+    else:
+        raise ValueError(f"Unknown balance_mode: {balance_mode}")
 
-    trimmed_groups = {label: group.iloc[:min_count].copy() for label, group in class_groups.items()}
-    balanced_df = pd.concat(trimmed_groups.values(), ignore_index=True)
-
-    train_count, val_count, test_count = per_class_split_count(min_count, train_ratio, val_ratio)
+    train_count, val_count, test_count = per_class_split_count(per_class_size, train_ratio, val_ratio)
     train_parts: List[pd.DataFrame] = []
     val_parts: List[pd.DataFrame] = []
     test_parts: List[pd.DataFrame] = []
 
-    for _, group in sorted(trimmed_groups.items()):
+    for _, group in sorted(working_groups.items()):
         train_parts.append(group.iloc[:train_count])
         val_parts.append(group.iloc[train_count : train_count + val_count])
         test_parts.append(group.iloc[train_count + val_count : train_count + val_count + test_count])
@@ -543,7 +633,20 @@ def main() -> None:
             inference_count=args.inference_count,
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
+            balance_mode=args.balance_mode,
         )
+    
+    # Apply CN sample limiting if specified
+    cn_limit_diagnostics: Dict[str, object] = {}
+    if not args.skip_balancing and args.max_cn_ratio is not None:
+        train_df, val_df, test_df, cn_limit_diagnostics = apply_cn_sample_limit(
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            max_cn_ratio=args.max_cn_ratio,
+            seed=args.seed,
+        )
+        split_diagnostics["cn_limiting"] = cn_limit_diagnostics
 
     all_path = output_root / "all_balanced_metadata.csv"
     train_path = output_root / "train_metadata.csv"
