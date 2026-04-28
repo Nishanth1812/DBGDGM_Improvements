@@ -153,6 +153,18 @@ def merge_lookups(primary: Dict[str, int], secondary: Dict[str, int]) -> Dict[st
     return merged
 
 
+def serialize_diagnostics(diagnostics: Dict[str, object]) -> Dict[str, object]:
+    serialized: Dict[str, object] = {}
+    for key, value in diagnostics.items():
+        if isinstance(value, Counter):
+            serialized[key] = {str(k): int(v) for k, v in value.items()}
+        elif isinstance(value, (int, float, str)):
+            serialized[key] = value
+        else:
+            serialized[key] = str(value)
+    return serialized
+
+
 def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
@@ -197,8 +209,8 @@ def main() -> None:
 
     merged_dist = Counter(merged.values())
     summary = {
-        "fmri": {k: int(v) if not isinstance(v, Counter) else {str(x): int(y) for x, y in v.items()} for k, v in fmri_diag.items()},
-        "smri": {k: int(v) if not isinstance(v, Counter) else {str(x): int(y) for x, y in v.items()} for k, v in smri_diag.items()},
+        "fmri": serialize_diagnostics(fmri_diag),
+        "smri": serialize_diagnostics(smri_diag),
         "primary": primary_name,
         "merged_subjects": len(merged),
         "merged_label_distribution": {str(k): int(v) for k, v in merged_dist.items()},
