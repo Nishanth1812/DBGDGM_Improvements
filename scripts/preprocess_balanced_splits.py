@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inference-count", type=int, default=1)
     parser.add_argument("--labels-csv", type=Path, default=None, help="Optional CSV with subject-level labels")
+    parser.add_argument("--labels-root", type=Path, default=None,
+                        help="Optional root folder to search for label CSVs (e.g., uploaded local labels)")
     parser.add_argument("--skip-balancing", action="store_true", help="Skip balancing and write all data to train split")
     parser.add_argument("--balance-mode", type=str, default="trim", choices=("trim", "upsample"),
                         help="How to balance classes: trim (reduce to smallest) or upsample (oversample minorities)")
@@ -131,11 +133,11 @@ def find_first_matching_column(columns: Iterable[str], candidates: Tuple[str, ..
     return None
 
 
-def discover_label_csv_candidates(extracted_root: Path) -> List[Path]:
+def discover_label_csv_candidates(extracted_root: Path, extra_roots: Optional[List[Path]] = None) -> List[Path]:
     candidate_names = ["labels.csv", "metadata.csv", "manifest.csv", "diagnosis.csv", "dx.csv"]
     search_roots: List[Path] = [extracted_root]
-    if extracted_root.parent != extracted_root:
-        search_roots.append(extracted_root.parent)
+    if extra_roots:
+        search_roots.extend(extra_roots)
 
     discovered: Dict[str, Path] = {}
     for root in search_roots:
@@ -189,6 +191,7 @@ def resolve_label_lookup(
     extracted_root: Path,
     explicit_labels_csv: Optional[Path],
     paired_subject_ids: List[str],
+    labels_root: Optional[Path] = None,
 ) -> Tuple[Optional[Dict[str, int]], Dict[str, object]]:
     if explicit_labels_csv is not None:
         explicit_path = explicit_labels_csv.expanduser().resolve()
@@ -201,9 +204,20 @@ def resolve_label_lookup(
         LOGGER.info("Using explicit labels CSV: %s (overlap %s/%s)", explicit_path, overlap, len(paired_subject_ids))
         return lookup, {"selected": diagnostics, "candidates": [diagnostics]}
 
-    candidates = discover_label_csv_candidates(extracted_root)
+    extra_roots: List[Path] = []
+    if labels_root is not None:
+        labels_root = labels_root.expanduser().resolve()
+        if labels_root.exists():
+            extra_roots.append(labels_root)
+        else:
+            LOGGER.warning("labels-root does not exist: %s", labels_root)
+
+    candidates = discover_label_csv_candidates(extracted_root, extra_roots=extra_roots)
     if not candidates:
-        LOGGER.warning("No candidate labels CSV found near extracted data.")
+        LOGGER.warning(
+            "No candidate labels CSV found in extracted root%s.",
+            " or labels-root" if extra_roots else "",
+        )
         return None, {"selected": {}, "candidates": []}
 
     LOGGER.info("Found %s candidate metadata CSV file(s)", len(candidates))
@@ -492,10 +506,46 @@ def build_balanced_splits(
     # group by label without shuffling yet
     class_groups = {int(label): group.reset_index(drop=True) for label, group in remaining_df.groupby("label")}
     if len(class_groups) < 2:
-        raise ValueError(
-            "Need at least two classes for balanced splitting. "
-            f"Observed labels after inference holdout: {counter_to_dict(after_holdout_counts)}"
+        LOGGER.warning(
+            "Only one class available after inference holdout: %s. Falling back to unbalanced split.",
+            counter_to_dict(after_holdout_counts),
         )
+        remaining = remaining_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        if len(remaining) < 3:
+            train_df = remaining.copy()
+            val_df = remaining.copy()
+            test_df = remaining.copy()
+        else:
+            val_n = max(1, int(len(remaining) * val_ratio))
+            test_n = max(1, int(len(remaining) * test_ratio))
+            train_n = len(remaining) - val_n - test_n
+            if train_n < 1:
+                train_n = 1
+                if val_n > test_n and val_n > 1:
+                    val_n -= 1
+                elif test_n > 1:
+                    test_n -= 1
+
+            train_df = remaining.iloc[:train_n].copy()
+            val_df = remaining.iloc[train_n : train_n + val_n].copy()
+            test_df = remaining.iloc[train_n + val_n : train_n + val_n + test_n].copy()
+
+            if val_df.empty:
+                val_df = train_df.iloc[:1].copy()
+            if test_df.empty:
+                test_df = train_df.iloc[:1].copy()
+
+        balanced_df = remaining.copy()
+        diagnostics = {
+            "mode": "single_class_fallback",
+            "reason": "single_class_after_holdout",
+            "label_distribution_before_holdout": counter_to_dict(Counter(df["label"])),
+            "label_distribution_after_holdout": counter_to_dict(after_holdout_counts),
+            "train_distribution": counter_to_dict(Counter(train_df["label"])),
+            "val_distribution": counter_to_dict(Counter(val_df["label"])),
+            "test_distribution": counter_to_dict(Counter(test_df["label"])),
+        }
+        return balanced_df, train_df, val_df, test_df, inference_df, diagnostics
 
     # Balance according to chosen mode
     if balance_mode == "trim":
@@ -579,6 +629,7 @@ def main() -> None:
             extracted_root=extracted_root,
             explicit_labels_csv=args.labels_csv,
             paired_subject_ids=paired_subject_ids,
+            labels_root=args.labels_root,
         )
     except Exception as exc:
         LOGGER.warning("Label CSV resolution failed: %s", exc)
