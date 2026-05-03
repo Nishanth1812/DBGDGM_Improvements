@@ -32,6 +32,6 @@ inference:
 
 labels:
   0: CN
-  1: eMCI
+  1: MCI
   2: lMCI
   3: AD

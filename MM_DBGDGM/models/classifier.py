@@ -16,11 +16,11 @@ class ClassificationHead(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),   # LayerNorm works with any batch size (incl. 1)
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, latent_dim),
-            nn.BatchNorm1d(latent_dim),
+            nn.LayerNorm(latent_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(latent_dim, num_classes),

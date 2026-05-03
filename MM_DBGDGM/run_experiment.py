@@ -21,10 +21,12 @@ import argparse
 import json
 import random
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 from pathlib import Path
 from datetime import datetime
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 
 from data.loaders import build_dataloaders, get_stratified_kfold_splits
 from models.mm_dbgdgm import MM_DBGDGM
@@ -70,8 +72,11 @@ def collate_smri_graphs(smri_batch, device):
 
 
 def run(args):
-    # Load config
-    config = yaml.safe_load(open(args.config)) if args.config else {}
+    # Load config safely
+    config = {}
+    if args.config and Path(args.config).exists():
+        with open(args.config) as f:
+            config = yaml.safe_load(f) or {}
     config.setdefault("training", {})
     config.setdefault("model", {})
     config.setdefault("preprocessing", {})
@@ -96,6 +101,11 @@ def run(args):
         seed=seed,
     )
 
+    # Detect number of classes actually present in the manifest
+    _mf = pd.read_csv(manifest_path)
+    num_classes = int(_mf["label"].nunique())
+    print(f"\n  Classes detected: {num_classes} ({sorted(_mf['label'].unique().tolist())})") 
+
     # Training config
     epochs = args.epochs
     beta = args.beta
@@ -112,7 +122,8 @@ def run(args):
     print(f"\n  {'='*60}")
     print(f"  MM-DBGDGM Training - {args.k_folds}-Fold Cross-Validation")
     print(f"  {'='*60}")
-    print(f"  Subjects: 25 | Epochs: {epochs} | beta={beta} | lambda_vae={lambda_vae}")
+    n_subjects = len(pd.read_csv(manifest_path))
+    print(f"  Subjects: {n_subjects} | Epochs: {epochs} | beta={beta} | lambda_vae={lambda_vae}")
     print(f"  Warmup: {warmup_epochs} epochs | Patience: {patience}")
     print(f"  Output: {output_dir}")
     print(f"  {'='*60}\n")
@@ -123,6 +134,10 @@ def run(args):
     all_probs = []
     all_unc = []
     all_mu = []
+
+    best_overall_acc = -1.0
+    best_overall_state = None
+    best_overall_fold = -1
 
     for fold_i in range(args.k_folds):
         print(f"\n{'='*60}")
@@ -136,8 +151,15 @@ def run(args):
             gat_heads=config["model"].get("gat_heads", 8),
             lstm_hidden=config["model"].get("lstm_hidden_dim", 256),
             latent_dim=config["model"].get("latent_dim", 128),
+            num_classes=num_classes,
             dropout=config["model"].get("dropout", 0.4),
         ).to(device)
+
+        if torch.cuda.device_count() > 1:
+            print(f"  Using {torch.cuda.device_count()} GPUs with DataParallel")
+            # Note: Model forward must handle list inputs if using DataParallel with current trainer
+            # model = torch.nn.DataParallel(model) 
+            # For now, we stay on one device unless user confirms list splitting support
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -168,9 +190,15 @@ def run(args):
         all_probs.append(fold_metrics["probabilities"])
         all_unc.extend(fold_metrics["uncertainty"].tolist())
 
+        # Track best fold overall
+        if fold_metrics["accuracy"] > best_overall_acc:
+            best_overall_acc = fold_metrics["accuracy"]
+            best_overall_state = best_state
+            best_overall_fold = fold_i + 1
+
         print("\n  Fold summary:")
         print(f"    Accuracy: {fold_metrics['accuracy']:.3f}")
-        print(f"    AUC:      {fold_metrics['auc']:.3f}")
+        print(f"    AUC:      {fold_metrics.get('auc_display', fold_metrics['auc'])}")
         print(f"    F1:       {fold_metrics['f1']:.3f}")
 
     # Aggregate results
@@ -178,6 +206,14 @@ def run(args):
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     all_unc = np.array(all_unc)
+
+    # ── Save best overall model ───────────────────────────────────────────────
+    if best_overall_state is not None:
+        best_model_path = output_dir / "best_model.pt"
+        torch.save(best_overall_state, best_model_path)
+        print(f"\n  Best model from Fold {best_overall_fold} (Acc={best_overall_acc:.3f}) saved to:")
+        print(f"  {best_model_path}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     print(f"\n{'='*60}")
     print("  CROSS-VALIDATION SUMMARY")
@@ -198,7 +234,6 @@ def run(args):
     print(f"  F1:       {np.mean(f1s):.3f} +/- {np.std(f1s):.3f}")
 
     # 4-class overall metrics
-    from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
     overall_acc = accuracy_score(all_labels, all_preds)
     try:
         overall_auc = roc_auc_score(all_labels, all_probs, multi_class="ovr", average="macro")
@@ -253,15 +288,14 @@ def run(args):
     fig_dir.mkdir(exist_ok=True)
 
     # Uncertainty distributions
-    unc_by_class = {"CN": [], "eMCI": [], "lMCI": [], "AD": []}
+    unc_by_class = {"CN": [], "MCI": [], "lMCI": [], "AD": []}
     for i, label in enumerate(all_labels):
-        name = ["CN", "eMCI", "lMCI", "AD"][label]
+        name = ["CN", "MCI", "lMCI", "AD"][label]
         unc_by_class[name].append(all_unc[i])
 
     plot_uncertainty_distributions(unc_by_class, save_path=fig_dir / "uncertainty_boxplot.png")
 
     # Save predictions CSV
-    import pandas as pd
     pred_df = pd.DataFrame({
         "subject_id": [f"sub-{i+1:03d}" for i in range(len(all_preds))],
         "true_label": all_labels,

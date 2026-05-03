@@ -115,7 +115,10 @@ def build_structural_graph(smri_features: np.ndarray):
             if nb > roi:
                 edges.append([roi, nb])
 
-    edge_index = np.array(edges).T
+    if len(edges) > 0:
+        edge_index = np.array(edges, dtype=np.int64).T  # shape (2, E)
+    else:
+        edge_index = np.zeros((2, 0), dtype=np.int64)
 
     data = Data(
         x=torch.from_numpy(smri_features.astype(np.float32)),

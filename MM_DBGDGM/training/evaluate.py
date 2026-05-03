@@ -10,7 +10,7 @@ from sklearn.metrics import (
 def compute_metrics(labels, predictions, probabilities, uncertainty, label_names=None):
     """Compute comprehensive metrics."""
     if label_names is None:
-        label_names = ["CN", "eMCI", "lMCI", "AD"]
+        label_names = ["CN", "MCI", "lMCI", "AD"]
 
     metrics = {}
 
@@ -27,7 +27,7 @@ def compute_metrics(labels, predictions, probabilities, uncertainty, label_names
         metrics[f"precision_{name}"] = precision_score(labels, predictions, labels=[i], average="micro", zero_division=0)
         metrics[f"recall_{name}"] = recall_score(labels, predictions, labels=[i], average="micro", zero_division=0)
 
-    # Binary CN vs eMCI
+    # Binary CN vs MCI
     cn_emci_mask = (labels == 0) | (labels == 1)
     if cn_emci_mask.sum() > 0:
         cn_emci_labels = labels[cn_emci_mask]
@@ -48,7 +48,7 @@ def compute_metrics(labels, predictions, probabilities, uncertainty, label_names
 
 def print_metrics(metrics, label_names=None):
     if label_names is None:
-        label_names = ["CN", "eMCI", "lMCI", "AD"]
+        label_names = ["CN", "MCI", "lMCI", "AD"]
 
     print("\n" + "=" * 60)
     print("  EVALUATION RESULTS")
@@ -64,13 +64,13 @@ def print_metrics(metrics, label_names=None):
         print(f"    {name:<6}: P={p:.3f}, R={r:.3f}")
 
     if "cn_vs_emci_acc" in metrics:
-        print(f"\n  CN vs eMCI binary:")
+        print(f"\n  CN vs MCI binary:")
         print(f"    Accuracy: {metrics['cn_vs_emci_acc']:.4f}")
         print(f"    AUC:      {metrics['cn_vs_emci_auc']:.4f}")
 
     print("\n  Confusion matrix:")
     cm = np.array(metrics["confusion_matrix"])
-    print(f"    Predicted?    CN   eMCI  lMCI   AD")
+    print(f"    Predicted?    CN   MCI  lMCI   AD")
     for i, name in enumerate(label_names):
         print(f"    True {name:<4}   {cm[i].tolist()}")
     print("=" * 60)

@@ -10,14 +10,14 @@ def plot_uncertainty_distributions(uncertainty_by_class, save_path=None):
         uncertainty_by_class: dict {class_name: [unc_values]}
         save_path: path to save PNG
     """
-    class_names = ["CN", "eMCI", "lMCI", "AD"]
+    class_names = ["CN", "MCI", "AD"]
     data = [uncertainty_by_class.get(name, []) for name in class_names]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Box plot
     bp = axes[0].boxplot(data, labels=class_names, patch_artist=True)
-    colors = ["#2ecc71", "#3498db", "#f39c12", "#e74c3c"]
+    colors = ["#2ecc71", "#3498db", "#e74c3c"]
     for patch, color in zip(bp["boxes"], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
@@ -26,7 +26,12 @@ def plot_uncertainty_distributions(uncertainty_by_class, save_path=None):
     axes[0].grid(axis="y", alpha=0.3)
 
     # Accuracy split by uncertainty
-    median_unc = np.median(np.concatenate(data))
+    all_data = [d for d in data if len(d) > 0]
+    if all_data:
+        median_unc = np.median(np.concatenate(all_data))
+    else:
+        median_unc = 0.5
+
     acc_low = 0.85  # placeholder
     acc_high = 0.65  # placeholder
 
@@ -57,7 +62,7 @@ def plot_reliability_diagram(probs, labels, n_bins=10, save_path=None):
         n_bins: number of bins
         save_path: path to save PNG
     """
-    class_names = ["CN", "eMCI", "lMCI", "AD"]
+    class_names = ["CN", "MCI", "AD"]
     pred_class = probs.argmax(axis=1)
     confidences = probs.max(axis=1)
     accuracies = (pred_class == labels).astype(float)

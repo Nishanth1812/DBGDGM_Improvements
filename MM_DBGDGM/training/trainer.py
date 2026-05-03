@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
 from pathlib import Path
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
+from preprocessing.fmri_pipeline import build_fmri_graphs
+from preprocessing.smri_pipeline import build_structural_graph
 
 from .losses import combined_loss
 
@@ -20,10 +22,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, warmup_epochs
         labels = batch["label"].to(device)
 
         optimizer.zero_grad()
-
-        # Build graphs on-the-fly
-        from preprocessing.fmri_pipeline import build_fmri_graphs
-        from preprocessing.smri_pipeline import build_structural_graph
 
         batch_graphs = []
         for b in range(fmri.size(0)):
@@ -76,9 +74,6 @@ def evaluate(model, val_loader, device):
     all_probs = []
     all_unc = []
 
-    from preprocessing.fmri_pipeline import build_fmri_graphs
-    from preprocessing.smri_pipeline import build_structural_graph
-
     for batch in val_loader:
         fmri = batch["fmri"].to(device)
         smri = batch["smri"].to(device)
@@ -109,15 +104,22 @@ def evaluate(model, val_loader, device):
     all_unc = torch.cat(all_unc).numpy()
 
     acc = accuracy_score(all_labels, all_preds)
-    try:
-        auc = roc_auc_score(all_labels, all_probs, multi_class="ovr", average="macro")
-    except:
-        auc = 0.0
-    f1 = f1_score(all_labels, all_preds, average="macro")
+
+    n_unique = len(np.unique(all_labels))
+    if n_unique < 2:
+        auc = float('nan')  # Can't compute AUC with only 1 class in val fold
+    else:
+        try:
+            auc = roc_auc_score(all_labels, all_probs, multi_class="ovr", average="macro")
+        except Exception:
+            auc = float('nan')
+
+    f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
     return {
         "accuracy": acc,
-        "auc": auc,
+        "auc": auc if not np.isnan(auc) else 0.0,  # store 0 for JSON-compatibility
+        "auc_display": f"{auc:.3f}" if not np.isnan(auc) else "N/A (val fold has 1 class)",
         "f1": f1,
         "predictions": all_preds,
         "labels": all_labels,
@@ -141,9 +143,9 @@ def train_fold(
     lambda_vae=0.1,
     beta=2.0,
 ):
-    best_val_auc = 0
+    best_val_score = -1.0
     patience_counter = 0
-    best_state = None
+    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}  # init to starting weights
 
     for epoch in range(epochs):
         loss, ce, kl = train_one_epoch(
@@ -157,11 +159,13 @@ def train_fold(
         print(
             f"  Fold {fold_i+1} | Epoch {epoch+1:3d} | "
             f"Loss: {loss:.4f} (CE: {ce:.4f}, KL: {kl:.4f}) | "
-            f"Val Acc: {val_metrics['accuracy']:.3f} | Val AUC: {val_metrics['auc']:.3f}"
+            f"Val Acc: {val_metrics['accuracy']:.3f} | Val AUC: {val_metrics['auc_display']}"
         )
 
-        if val_metrics["auc"] > best_val_auc:
-            best_val_auc = val_metrics["auc"]
+        # Use accuracy for early stopping (robust when val fold has <2 classes)
+        val_score = val_metrics["accuracy"]
+        if val_score > best_val_score:
+            best_val_score = val_score
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
@@ -174,7 +178,7 @@ def train_fold(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = checkpoint_dir / f"fold_{fold_i+1}_best.pt"
     torch.save(best_state, ckpt_path)
-    print(f"  Best Val AUC: {best_val_auc:.3f} -> {ckpt_path}")
+    print(f"  Best Val Acc: {best_val_score:.3f} -> {ckpt_path}")
 
     # Restore best model for final evaluation
     model.load_state_dict(best_state)

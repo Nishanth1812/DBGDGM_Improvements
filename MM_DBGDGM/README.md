@@ -20,7 +20,7 @@ fMRI stream (DBGDGM)          sMRI stream (structural)
                       ?
                       ?
               MLP classifier ? 4 classes
-              (CN, eMCI, lMCI, AD)
+              (CN, MCI, lMCI, AD)
 ```
 
 ## Quick Start
@@ -93,7 +93,7 @@ mm_dbgdgm/
 
 ## Synthetic Data
 
-25 subjects: 7 CN, 6 eMCI, 6 lMCI, 6 AD
+25 subjects: 7 CN, 6 MCI, 6 lMCI, 6 AD
 
 - **fMRI**: 90 AAL ROIs ? 200 timepoints; group differences in DMN coherence (CN=1.0, AD=0.45)
 - **sMRI**: 90 regions ? 4 features; hippocampal/entorhinal atrophy (CN=none, AD=38%)

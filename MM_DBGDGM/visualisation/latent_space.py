@@ -9,16 +9,16 @@ def plot_latent_space(mu_vectors, labels, uncertainty=None, save_path=None):
 
     Args:
         mu_vectors: (N, 128) latent means
-        labels: (N,) int labels (0=CN, 1=eMCI, 2=lMCI, 3=AD)
+        labels: (N,) int labels (0=CN, 1=MCI, 2=lMCI, 3=AD)
         uncertainty: (N,) scalar uncertainty ??, or None
         save_path: path to save PNG
     """
     tsne = TSNE(n_components=2, random_state=42, perplexity=min(10, len(mu_vectors) - 1))
     mu_2d = tsne.fit_transform(mu_vectors)
 
-    class_names = ["CN", "eMCI", "lMCI", "AD"]
-    colors = ["#2ecc71", "#3498db", "#f39c12", "#e74c3c"]
-    markers = ["o", "s", "^", "D"]
+    class_names = ["CN", "MCI", "AD"]
+    colors = ["#2ecc71", "#3498db", "#e74c3c"]
+    markers = ["o", "s", "D"]
 
     fig, ax = plt.subplots(figsize=(8, 7))
 

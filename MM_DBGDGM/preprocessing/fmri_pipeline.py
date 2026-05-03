@@ -17,13 +17,17 @@ def build_fmri_graphs(fmri_time_series: np.ndarray, window_size: int = 30, windo
         List of PyG Data objects, one per window
     """
     n_rois, n_times = fmri_time_series.shape
+
+    # If the time series is shorter than window_size, use the full series as one window
+    actual_window = min(window_size, n_times)
     graphs = []
 
-    for start in range(0, n_times - window_size + 1, window_stride):
-        window = fmri_time_series[:, start:start + window_size]
+    for start in range(0, n_times - actual_window + 1, window_stride):
+        window = fmri_time_series[:, start:start + actual_window]
 
-        # Pearson correlation matrix
+        # Pearson correlation matrix; replace NaN (constant signal) with 0
         corr = np.corrcoef(window)
+        corr = np.nan_to_num(corr, nan=0.0)
         np.fill_diagonal(corr, 0.0)
 
         abs_corr = np.abs(corr)
@@ -31,18 +35,32 @@ def build_fmri_graphs(fmri_time_series: np.ndarray, window_size: int = 30, windo
         mask = abs_corr >= threshold
 
         # Build edge index
-        edge_index = np.argwhere(mask)
-        edge_weight = corr[mask]
+        src, dst = np.where(mask)
+        if len(src) == 0:
+            # Ensure at least a self-loop to prevent empty graph crash
+            src = np.arange(n_rois)
+            dst = np.arange(n_rois)
+        edge_index = np.stack([src, dst], axis=0)
+        edge_weight = corr[mask] if corr[mask].size > 0 else np.zeros(len(src), dtype=np.float32)
 
         # Node features: mean activation in window
         node_features = window.mean(axis=1, keepdims=True).astype(np.float32)
 
         data = Data(
             x=torch.from_numpy(node_features),
-            edge_index=torch.from_numpy(edge_index.T).long(),
-            edge_attr=torch.from_numpy(edge_weight).float(),
+            edge_index=torch.from_numpy(edge_index).long(),
+            edge_attr=torch.from_numpy(edge_weight.astype(np.float32)),
         )
         graphs.append(data)
+
+    # Guarantee at least one graph even for very short time series
+    if len(graphs) == 0:
+        node_features = fmri_time_series.mean(axis=1, keepdims=True).astype(np.float32)
+        graphs.append(Data(
+            x=torch.from_numpy(node_features),
+            edge_index=torch.zeros((2, 0), dtype=torch.long),
+            edge_attr=torch.zeros(0),
+        ))
 
     return graphs
 
